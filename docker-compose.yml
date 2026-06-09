@@ -1,0 +1,54 @@
+# =============================================================================
+# Isolated Claude Code environment for pilotless_poses
+#
+# What this does:
+#   - The entire workspace is bind-mounted into the container.
+#   - You edit files on the host with VS Code (or any editor).
+#   - Changes are instantly visible inside the container — no sync tooling needed.
+#   - Claude Code runs inside the container and CANNOT touch files outside
+#     the mounted workspace or harm the host OS.
+#
+# Usage:
+#   docker compose up -d              # Start the container (detached)
+#   ./enter-claude.sh                 # Enter container and run Claude Code
+#   docker compose down               # Stop the container
+#   docker compose build --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g)
+# =============================================================================
+
+services:
+  pilotless-poses:
+    build:
+      context: .
+      args:
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
+    image: pilotless-poses:dev
+    container_name: pilotless-poses-isolated
+    hostname: pilotless-poses
+    # Make stdin interactive (needed for Claude Code's TUI)
+    stdin_open: true
+    tty: true
+    volumes:
+      # Bind-mount the entire workspace — real-time bidirectional sync.
+      # Edit on the host, changes appear instantly in the container.
+      - .:/workspace:cached
+    environment:
+      # Pass through terminal capabilities for Claude Code's TUI
+      - TERM=${TERM:-xterm-256color}
+      # Claude Code looks for this
+      - HOME=/home/developer
+    # If you need GPU access for VitPose inference, uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks:
+      - isolated-net
+    restart: unless-stopped
+
+networks:
+  isolated-net:
+    driver: bridge

@@ -1,0 +1,5 @@
+{
+  "pythonPath": "python3",
+  "port": 8000,
+  "maxConcurrency": 3
+}

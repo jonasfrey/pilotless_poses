@@ -1,0 +1,122 @@
+You are an expert full-stack developer building a local-only web application for batch pose detection using VitPose. Follow these specifications precisely.
+
+## Technology Stack
+- **Backend server**: Deno.js (TypeScript runtime) — handles HTTP, WebSocket connections, and spawns Python child processes.
+- **ML inference**: Python scripts using VitPose (Vision Transformer for Pose Estimation) for human pose keypoint detection on static images.
+- **Frontend**: Vanilla JavaScript (or lightweight framework like Preact if needed), served as static files by the Deno server.
+- **Communication**: WebSocket between browser client and Deno server for real-time progress updates and result streaming.
+- **Data format**: All pose results stored as JSON files on disk.
+
+## Application Architecture
+
+### Deno Server
+1. Serve static frontend files (HTML, CSS, JS) from a `./public` directory.
+2. Expose a WebSocket endpoint at `/ws` that the client connects to.
+3. On receiving a `scan_folder` message from the client (containing a folder path and file extension filter like `.jpg,.png`), the server:
+   a. Validates the folder exists and is readable.
+   b. Scans the folder for image files matching the filter.
+   c. For each image, spawns a Python child process that runs VitPose inference, passing the image path as an argument.
+   d. The Python script outputs pose keypoints as JSON to stdout.
+   e. The server captures stdout, parses the JSON, and writes the result to an output directory (mirroring the source folder structure or using a flat `results/` folder) as `<image_basename>_pose.json`.
+   f. Sends progress WebSocket messages to the client: `{ type: "progress", current: N, total: M, file: "image_name.jpg", status: "processing"|"done"|"error" }`.
+   g. When all images are processed, sends `{ type: "batch_complete", total: M, errors: [...] }`.
+4. On receiving a `get_results` message (containing a folder path), the server scans the results directory and returns a list of result JSON files with their associated source image paths.
+5. On receiving a `get_pose_data` message (containing a result JSON path), the server reads and returns the full pose data for rendering.
+
+### Python VitPose Script
+1. Accept image path as a command-line argument.
+2. Load a pretrained VitPose model (ViTPose-huge or ViTPose-base depending on available resources).
+3. Run inference and extract keypoints with confidence scores.
+4. Output a JSON object to stdout with this structure:
+   ```json
+   {
+     "image": "path/to/image.jpg",
+     "people": [
+       {
+         "id": 0,
+         "bbox": [x, y, w, h],
+         "keypoints": [
+           {"name": "nose", "x": 123.4, "y": 567.8, "confidence": 0.98},
+           {"name": "left_eye", "x": 130.1, "y": 550.2, "confidence": 0.95},
+           ...all COCO 17 keypoints...
+         ]
+       }
+     ],
+     "image_width": 1920,
+     "image_height": 1080
+   }
+   ```
+   Use the standard COCO 17-keypoint format: nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist, left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle.
+5. Handle errors gracefully: if inference fails, output `{ "error": "message" }` and exit with code 1.
+
+### Frontend GUI (Two Pages)
+
+#### Page 1: Folder Scan (landing page)
+- **Folder path input**: Text field where the user types or pastes a folder path. Include a "Browse" button that triggers a file input (`webkitdirectory`) for folder selection (browser limitation: returns relative paths; display the folder name and store the full path from the text input).
+- **File extension filter**: Checkboxes or a text input for extensions (default: `.jpg, .jpeg, .png`).
+- **Output directory**: Text field (defaults to `./pose_results/` relative to server working directory, or mirrors source structure).
+- **"Start Scan" button**: Disabled while a scan is running. On click, sends `scan_folder` via WebSocket with the folder path and options.
+- **Progress section**:
+  - A progress bar showing current/total.
+  - A scrollable log/table listing each file and its status (queued → processing → done ✓ / error ✗), updating in real time via WebSocket messages.
+  - A summary at the end: "X of Y images processed successfully. Z errors."
+- **Navigation**: Link/button to go to the Preview page.
+
+#### Page 2: Pose Preview
+- **Image selector**: A dropdown or thumbnail grid listing all processed images (loaded by sending `get_results` for a folder path). Each entry shows the source image thumbnail and filename.
+- **Canvas overlay display**: When an image is selected:
+  - Load and display the original image on an HTML Canvas element (or an `<img>` with an overlaid SVG/Canvas).
+  - Fetch the pose JSON for that image via WebSocket (`get_pose_data`).
+  - Draw the skeleton overlay on top:
+    - **Keypoints**: Small filled circles at each keypoint location, color-coded by confidence (green ≥ 0.7, yellow ≥ 0.3, red < 0.3).
+    - **Skeleton lines**: Connect related keypoints with lines following the standard COCO skeleton pairs:
+      - (nose, left_eye), (nose, right_eye)
+      - (left_eye, left_ear), (right_eye, right_ear)
+      - (left_shoulder, right_shoulder)
+      - (left_shoulder, left_elbow), (right_shoulder, right_elbow)
+      - (left_elbow, left_wrist), (right_elbow, right_wrist)
+      - (left_shoulder, left_hip), (right_shoulder, right_hip)
+      - (left_hip, right_hip)
+      - (left_hip, left_knee), (right_hip, right_knee)
+      - (left_knee, left_ankle), (right_knee, right_ankle)
+    - **Labels**: Text labels next to each visible keypoint showing the human-readable name (e.g., "Left Ankle", "Right Shoulder"), positioned offset from the point to avoid overlap.
+  - Handle multiple people: render each person's skeleton in a different color.
+- **Controls**:
+  - Toggle overlay visibility (show/hide skeleton).
+  - Toggle labels visibility.
+  - Opacity slider for the skeleton overlay.
+  - "Previous" / "Next" navigation between images.
+  - Keyboard shortcuts: left/right arrow keys for navigation, H to toggle overlay, L to toggle labels.
+- **No-data state**: If the selected image has no pose data or the JSON is malformed, show a clear message: "No pose data available for this image."
+
+### JSON Data Storage
+- Results saved as individual JSON files per image: `<image_basename>_pose.json`
+- A manifest file `manifest.json` in the output directory maps source images to their result files:
+  ```json
+  {
+    "scan_date": "2026-06-09T12:00:00Z",
+    "source_folder": "/path/to/images",
+    "results": [
+      {"source": "photo1.jpg", "result": "photo1_pose.json", "status": "ok"},
+      {"source": "photo2.jpg", "result": "photo2_pose.json", "status": "error", "error_msg": "No person detected"}
+    ]
+  }
+  ```
+
+## Constraints
+- Everything runs locally on `localhost` only — no external network calls, no cloud services.
+- The Deno server must prompt the user to confirm the Python path (e.g., `python3` or a venv path) on first run, stored in a local config file.
+- Handle the case where VitPose model weights need to be downloaded on first run — the Python script should check and download if missing.
+- The app must work on Linux (primary) and macOS (secondary). Windows support is optional.
+- All dependencies (Deno modules, Python packages) must be listed in a setup/install section in the README.
+
+## Deliverables
+Generate these files:
+1. `server.ts` — Deno WebSocket + HTTP server
+2. `inference.py` — Python VitPose inference script
+3. `public/index.html` — Frontend HTML with both pages
+4. `public/app.js` — Frontend JavaScript (WebSocket client, UI logic, canvas rendering)
+5. `public/style.css` — Styling (clean, functional, dark theme preferred)
+6. `README.md` — Setup instructions, dependencies, how to run
+7. `requirements.txt` — Python dependencies
+8. `deno.json` or `deps.ts` — Deno dependencies and tasks

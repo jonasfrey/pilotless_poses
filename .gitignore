@@ -1,0 +1,31 @@
+# Python virtual environment (created automatically by the server)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded model weights & caches
+.model_cache/
+models/
+
+# Generated pose results
+pose_results/
+results/
+
+# Environment / secrets
+.env
+# deepseek_claude.txt contains an API auth token — never commit
+deepseek_claude.txt
+*.token
+*credentials*
+
+# Runtime data (the server seeds/writes these)
+processors.json
+testimages/
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db

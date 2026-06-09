@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pilotless Poses — Batch Pose Detection</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>Pilotless Poses</h1>
+    <span class="subtitle">Batch Pose Detection with VitPose</span>
+    <nav class="nav-tabs">
+      <button id="nav-scan"  class="nav-tab active" data-page="scan">Folder Scan</button>
+      <button id="nav-preview" class="nav-tab" data-page="preview">Pose Preview</button>
+      <button id="nav-processors" class="nav-tab" data-page="processors">Processors</button>
+    </nav>
+    <div class="connection-indicator" id="connection-indicator" title="WebSocket status">
+      <span class="dot"></span>
+      <span class="label">Disconnected</span>
+    </div>
+  </header>
+
+  <!-- ================================================================== -->
+  <!-- Page 1: Folder Scan                                                 -->
+  <!-- ================================================================== -->
+  <main id="page-scan" class="page active">
+    <section class="card">
+      <h2>Scan Configuration</h2>
+
+      <!-- Folder path + back button -->
+      <div class="form-group">
+        <label for="folder-path">Folder Path</label>
+        <div class="input-row">
+          <input type="text" id="folder-path" placeholder="/" value="/"
+                 autocomplete="off" spellcheck="false">
+          <button id="btn-back-scan" class="btn btn-icon" title="Go up one directory">←</button>
+        </div>
+      </div>
+
+      <!-- Inline file browser -->
+      <div class="browser-list" id="browser-list-scan">
+        <div class="browser-placeholder">Loading...</div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="ext-filter">File Extensions</label>
+          <input type="text" id="ext-filter" value=".jpg,.jpeg,.png"
+                 placeholder=".jpg,.png" autocomplete="off" spellcheck="false">
+          <p class="hint">Comma-separated, e.g. .jpg,.jpeg,.png,.bmp,.tiff</p>
+        </div>
+        <div class="form-group">
+          <label for="output-dir">Output Directory</label>
+          <input type="text" id="output-dir" value="./pose_results/"
+                 placeholder="./pose_results/" autocomplete="off" spellcheck="false">
+          <p class="hint">Relative to server working directory</p>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-start-scan" class="btn btn-primary">Start Scan</button>
+        <button id="btn-cancel-scan" class="btn btn-danger hidden">Cancel</button>
+      </div>
+    </section>
+
+    <!-- Progress Section -->
+    <section class="card" id="progress-section">
+      <h2>Progress</h2>
+      <div id="progress-bar-wrap" class="progress-bar-wrap">
+        <div id="progress-bar" class="progress-bar" style="width: 0%"></div>
+        <span id="progress-text" class="progress-text">0 / 0</span>
+      </div>
+      <div id="progress-summary" class="progress-summary"></div>
+      <div id="file-log" class="file-log">
+        <div class="log-placeholder">Waiting for scan to start...</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- Page 2: Pose Preview                                                -->
+  <!-- ================================================================== -->
+  <main id="page-preview" class="page">
+    <section class="card" id="preview-main">
+      <h2>Pose Preview</h2>
+      <div class="preview-layout">
+        <!-- Image selector sidebar -->
+        <aside class="image-sidebar" id="image-sidebar">
+          <div class="sidebar-header">
+            <h3>Images</h3>
+            <span id="image-count" class="badge">0</span>
+          </div>
+          <div class="sidebar-controls">
+            <button id="btn-run-processors" class="btn btn-primary btn-sm" title="Run all images against active processors">
+              Run Processors
+            </button>
+            <label class="show-filtered-control" title="Show images filtered out by processors">
+              <input type="checkbox" id="chk-show-filtered"> Show filtered
+            </label>
+          </div>
+          <div id="processor-filter-status" class="processor-filter-status"></div>
+          <div id="image-list" class="image-list">
+            <div class="placeholder">No images loaded. Run a scan first, then switch to this tab.</div>
+          </div>
+        </aside>
+
+        <!-- Canvas viewer -->
+        <div class="viewer-area" id="viewer-area">
+          <div class="viewer-placeholder" id="viewer-placeholder">
+            Select an image from the list to view pose overlay
+          </div>
+          <div class="canvas-container hidden" id="canvas-container">
+            <div class="canvas-toolbar" id="canvas-toolbar">
+              <button id="btn-toggle-overlay" class="btn btn-sm btn-active" title="Toggle skeleton overlay (H)">
+                Show Skeleton
+              </button>
+              <button id="btn-toggle-labels"  class="btn btn-sm btn-active" title="Toggle keypoint labels (L)">
+                Show Labels
+              </button>
+              <button id="btn-toggle-info" class="btn btn-sm" title="Toggle image data overlay (I)">
+                Show Info
+              </button>
+              <label class="opacity-control" title="Overlay opacity">
+                Opacity
+                <input type="range" id="opacity-slider" min="0.1" max="1" step="0.05" value="0.85">
+              </label>
+              <div class="nav-controls">
+                <button id="btn-prev-image" class="btn btn-sm" title="Previous image (←)">◀ Prev</button>
+                <span id="nav-index" class="nav-index">– / –</span>
+                <button id="btn-next-image" class="btn btn-sm" title="Next image (→)">Next ▶</button>
+              </div>
+            </div>
+            <div class="canvas-wrap" id="canvas-wrap">
+              <canvas id="pose-canvas"></canvas>
+              <div class="info-overlay hidden" id="info-overlay">
+                <div class="info-overlay-header">Image Data</div>
+                <dl class="info-overlay-body" id="info-overlay-body"></dl>
+              </div>
+            </div>
+            <div class="canvas-info" id="canvas-info"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- Page 3: Processors                                                  -->
+  <!-- ================================================================== -->
+  <main id="page-processors" class="page">
+    <section class="card" id="processors-main">
+      <h2>Processors</h2>
+      <div class="processors-layout">
+        <!-- Processor list sidebar -->
+        <aside class="processor-sidebar">
+          <div class="sidebar-header">
+            <h3>Saved Processors</h3>
+            <span id="processor-count" class="badge">0</span>
+          </div>
+          <button id="btn-new-processor" class="btn btn-primary btn-sm">+ New Processor</button>
+          <div id="processor-list" class="processor-list">
+            <div class="placeholder">No processors yet. Create one to get started.</div>
+          </div>
+        </aside>
+
+        <!-- Editor panel -->
+        <div class="processor-editor-area" id="processor-editor-area">
+          <div class="editor-placeholder" id="editor-placeholder">
+            Select a processor to edit, or create a new one.
+          </div>
+          <div class="editor-panel hidden" id="editor-panel">
+            <div class="form-row editor-meta-row">
+              <div class="form-group">
+                <label for="processor-name">Name</label>
+                <input type="text" id="processor-name" placeholder="e.g. At least one person"
+                       autocomplete="off" spellcheck="false">
+              </div>
+              <label class="active-control" title="Only active processors run">
+                <input type="checkbox" id="processor-active" checked> Active
+              </label>
+            </div>
+
+            <p class="hint editor-hint">
+              Write a JavaScript function body. The argument <code>image</code> holds the image and
+              its pose data. <strong>Return false</strong> (or any falsy value) to filter the image
+              out of the preview; return true to keep it.
+            </p>
+
+            <div class="editor-fields">
+              <span class="editor-signature">function (image) {</span>
+              <div id="monaco-editor" class="monaco-editor-host"></div>
+              <span class="editor-signature">}</span>
+            </div>
+
+            <div id="editor-message" class="editor-message"></div>
+
+            <div class="actions">
+              <button id="btn-save-processor" class="btn btn-primary">Save</button>
+              <button id="btn-delete-processor" class="btn btn-danger hidden">Delete</button>
+              <button id="btn-cancel-processor" class="btn btn-secondary">Cancel</button>
+            </div>
+
+            <details class="processor-help">
+              <summary>What's available on <code>image</code>?</summary>
+              <ul>
+                <li><code>image.source</code> — full path to the source image</li>
+                <li><code>image.fileName</code> — just the file name</li>
+                <li><code>image.width</code>, <code>image.height</code> — pixel dimensions</li>
+                <li><code>image.peopleCount</code> — number of detected people</li>
+                <li><code>image.people</code> — array of <code>{ id, keypoints: [{ name, x, y, confidence }] }</code></li>
+                <li><code>image.pose</code> — the full raw pose JSON</li>
+                <li><code>image.keypoint(name, personIndex = 0)</code> — helper to fetch one keypoint</li>
+              </ul>
+            </details>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <span>Pilotless Poses — VitPose Batch Pose Detection</span>
+    <span>All processing runs locally</span>
+  </footer>
+
+  <!-- Monaco editor (loaded lazily when the Processors tab is first opened) -->
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

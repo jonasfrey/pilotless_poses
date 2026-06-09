@@ -1,0 +1,10 @@
+# Python dependencies for VitPose inference (HuggingFace transformers)
+# The Deno server auto-installs missing packages on startup.
+# Manual install: pip install -r py-requirements.txt
+
+torch>=2.3.0
+torchvision>=0.18.0
+transformers>=4.48.0
+numpy>=1.24.0
+Pillow>=10.0.0
+supervision>=0.18.0

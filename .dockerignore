@@ -1,0 +1,39 @@
+# Node (if any)
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Deno
+DENO_DIR/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git (not needed in build context)
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+pose_results/
+results/
+*.log
