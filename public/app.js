@@ -150,6 +150,133 @@ function sendMessage(msg) {
   return true;
 }
 
+// Base64-encode bytes in chunks (avoids call-stack limits on large buffers).
+function bytesToBase64(bytes) {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// Server-side Deno.writeFile, exposed to processor functions as
+// `f_deno_write_file`. Accepts a string, Uint8Array, ArrayBuffer, or number[];
+// the write is proxied to the server over the WebSocket. Returns a Promise that
+// resolves true once the write is acknowledged (false if it failed or could not
+// be sent).
+function f_deno_write_file(path, data) {
+  let bytes;
+  if (typeof data === "string") {
+    bytes = new TextEncoder().encode(data);
+  } else if (data instanceof ArrayBuffer) {
+    bytes = new Uint8Array(data);
+  } else if (data instanceof Uint8Array) {
+    bytes = data;
+  } else if (Array.isArray(data)) {
+    bytes = Uint8Array.from(data);
+  } else {
+    return Promise.reject(
+      new TypeError(
+        "f_deno_write_file: data must be a string, Uint8Array, ArrayBuffer, or number[]",
+      ),
+    );
+  }
+
+  const sent = sendMessage({
+    type: "write_file",
+    path,
+    dataBase64: bytesToBase64(bytes),
+  });
+  if (!sent) return Promise.resolve(false);
+
+  // Resolve when the server reports this path's write result.
+  return new Promise((resolve) => {
+    STATE.pendingWrites = STATE.pendingWrites || new Map();
+    const queue = STATE.pendingWrites.get(path) || [];
+    queue.push(resolve);
+    STATE.pendingWrites.set(path, queue);
+  });
+}
+
+function handleWriteFileResult(msg) {
+  if (!msg.ok) {
+    console.error(`f_deno_write_file failed for "${msg.path}":`, msg.error);
+  }
+  const queue = STATE.pendingWrites && STATE.pendingWrites.get(msg.path);
+  if (queue && queue.length) {
+    queue.shift()(!!msg.ok);
+    if (queue.length === 0) STATE.pendingWrites.delete(msg.path);
+  }
+}
+
+// ---- Processor helper functions ---------------------------------------------
+//
+// In addition to o_img and f_deno_write_file, each processor receives a set of
+// convenience helpers bound to the current image, to simplify exporting it:
+//   f_save_image(dir)    — copy the image file into dir
+//   f_save_json(dir)     — write the image's pose JSON into dir (<name>_pose.json)
+//   f_save_filtered(dir) — do both (image + JSON)
+// All return a Promise resolving to whether the write(s) succeeded.
+
+const join_path = (dir, name) => String(dir).replace(/\/+$/, "") + "/" + name;
+
+// Build the image-bound helpers. `pose` is the raw pose JSON for the image
+// (may be null when inference failed).
+function makeImageHelpers(o_img, pose) {
+  async function f_save_image(destDir) {
+    const res = await fetch(
+      "/api/image?path=" + encodeURIComponent(o_img.s_path_abs),
+    );
+    if (!res.ok) {
+      throw new Error(
+        `f_save_image: HTTP ${res.status} fetching "${o_img.s_name_file}"`,
+      );
+    }
+    const buf = await res.arrayBuffer();
+    return f_deno_write_file(
+      join_path(destDir, o_img.s_name_file),
+      new Uint8Array(buf),
+    );
+  }
+
+  function f_save_json(destDir) {
+    // Mirror the server's naming (<filename>_pose.json) and contents.
+    const info = pose ??
+      { image: o_img.s_path_abs, error: o_img.s_msg_error || "no pose data" };
+    return f_deno_write_file(
+      join_path(destDir, o_img.s_name_file + "_pose.json"),
+      JSON.stringify(info, null, 2) + "\n",
+    );
+  }
+
+  async function f_save_filtered(destDir) {
+    const [okImg, okJson] = await Promise.all([
+      f_save_image(destDir),
+      f_save_json(destDir),
+    ]);
+    return okImg && okJson;
+  }
+
+  return { f_save_image, f_save_json, f_save_filtered };
+}
+
+// Argument names (and order) injected into every processor function. Keep the
+// compile sites and the call site in sync via this single list.
+const PROCESSOR_ARG_NAMES = [
+  "o_img",
+  "f_deno_write_file",
+  "f_save_image",
+  "f_save_json",
+  "f_save_filtered",
+];
+
+// Produce the concrete argument values for a processor call on one image.
+function processorArgs(o_img, pose) {
+  const h = makeImageHelpers(o_img, pose);
+  return [o_img, f_deno_write_file, h.f_save_image, h.f_save_json, h.f_save_filtered];
+}
+
 function updateConnectionIndicator(connected) {
   const el = document.getElementById("connection-indicator");
   if (!el) return;
@@ -188,6 +315,9 @@ function handleMessage(msg) {
       break;
     case "all_pose_data":
       handleAllPoseData(msg);
+      break;
+    case "write_file_result":
+      handleWriteFileResult(msg);
       break;
     case "error":
       handleError(msg);
@@ -266,9 +396,11 @@ function navigateTo(page) {
   const tabEl = document.getElementById(`nav-${page}`);
   if (tabEl) tabEl.classList.add("active");
 
-  // Auto-load results when switching to the preview page
+  // Auto-load results when switching to the preview page. Also refresh the
+  // processor list so the pipeline column reflects current active processors.
   if (page === "preview") {
     loadResults();
+    sendMessage({ type: "list_processors" });
   }
 
   // Load processors and bootstrap Monaco when entering the processors page
@@ -439,6 +571,8 @@ function initPreviewPage() {
   DOM.btnRunProcessors = document.getElementById("btn-run-processors");
   DOM.chkShowFiltered = document.getElementById("chk-show-filtered");
   DOM.processorFilterStatus = document.getElementById("processor-filter-status");
+  DOM.processorOrderList = document.getElementById("processor-order-list");
+  DOM.processorOrderCount = document.getElementById("processor-order-count");
   DOM.viewerPlaceholder = document.getElementById("viewer-placeholder");
   DOM.canvasContainer = document.getElementById("canvas-container");
   DOM.poseCanvas = document.getElementById("pose-canvas");
@@ -913,8 +1047,8 @@ const MONACO_VS = "https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs";
 
 const PROCESSOR_TEMPLATE =
   `// Return true to keep the image, false to filter it out of the preview.\n` +
-  `// e.g. keep only images where at least one person was detected:\n` +
-  `return image.peopleCount > 0;`;
+  `// The callback receives o_img — e.g. keep only images with a person:\n` +
+  `return o_img.n_persons > 0;`;
 
 function initProcessorsPage() {
   DOM.processorList = document.getElementById("processor-list");
@@ -1026,6 +1160,7 @@ function handleProcessorsList(msg) {
   }
 
   renderProcessorList();
+  renderProcessorOrder();
 
   // If we were editing a processor that no longer exists, close the editor.
   if (
@@ -1076,6 +1211,119 @@ function renderProcessorList() {
     div.addEventListener("click", () => editProcessor(p.id));
     list.appendChild(div);
   });
+}
+
+// ---- Pipeline column (active processors, reorderable) on the preview page ----
+
+let dragProcId = null;
+
+function renderProcessorOrder() {
+  const list = DOM.processorOrderList;
+  if (!list) return;
+
+  const active = STATE.processors.filter((p) => p.active);
+  if (DOM.processorOrderCount) {
+    DOM.processorOrderCount.textContent = String(active.length);
+  }
+
+  list.innerHTML = "";
+  if (active.length === 0) {
+    list.innerHTML = '<div class="placeholder">No active processors.</div>';
+    return;
+  }
+
+  active.forEach((p, i) => {
+    const div = document.createElement("div");
+    div.className = "processor-order-entry";
+    div.draggable = true;
+    div.dataset.id = p.id;
+
+    const handle = document.createElement("span");
+    handle.className = "po-handle";
+    handle.textContent = "⠿";
+    handle.title = "Drag to reorder";
+
+    const num = document.createElement("span");
+    num.className = "po-num";
+    num.textContent = String(i + 1);
+
+    const name = document.createElement("span");
+    name.className = "po-name";
+    name.textContent = p.name || "(unnamed)";
+    name.title = p.name || "";
+
+    div.append(handle, num, name);
+
+    div.addEventListener("dragstart", (e) => {
+      dragProcId = p.id;
+      div.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+      // Firefox requires data to be set for dragging to start.
+      e.dataTransfer.setData("text/plain", p.id);
+    });
+    div.addEventListener("dragend", () => {
+      dragProcId = null;
+      div.classList.remove("dragging");
+      list.querySelectorAll(".drop-before, .drop-after")
+        .forEach((el) => el.classList.remove("drop-before", "drop-after"));
+    });
+    div.addEventListener("dragover", (e) => {
+      if (!dragProcId || dragProcId === p.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      const after = isPointerInLowerHalf(e, div);
+      div.classList.toggle("drop-after", after);
+      div.classList.toggle("drop-before", !after);
+    });
+    div.addEventListener("dragleave", () => {
+      div.classList.remove("drop-before", "drop-after");
+    });
+    div.addEventListener("drop", (e) => {
+      e.preventDefault();
+      div.classList.remove("drop-before", "drop-after");
+      if (!dragProcId || dragProcId === p.id) return;
+      reorderActiveProcessors(dragProcId, p.id, isPointerInLowerHalf(e, div));
+    });
+
+    list.appendChild(div);
+  });
+}
+
+function isPointerInLowerHalf(event, el) {
+  const rect = el.getBoundingClientRect();
+  return event.clientY > rect.top + rect.height / 2;
+}
+
+// Move `draggedId` next to `targetId` among the active processors, then rebuild
+// STATE.processors so inactive entries keep their slots. Persists the new order
+// to the server and re-applies the pipeline if a run already produced results.
+function reorderActiveProcessors(draggedId, targetId, placeAfter) {
+  const activeIds = STATE.processors.filter((p) => p.active).map((p) => p.id);
+  const from = activeIds.indexOf(draggedId);
+  if (from === -1) return;
+  activeIds.splice(from, 1);
+
+  let to = activeIds.indexOf(targetId);
+  if (to === -1) to = activeIds.length;
+  else if (placeAfter) to += 1;
+  activeIds.splice(to, 0, draggedId);
+
+  // Fill the active slots in the new order; leave inactive entries in place.
+  const byId = Object.fromEntries(STATE.processors.map((p) => [p.id, p]));
+  let ai = 0;
+  STATE.processors = STATE.processors.map((p) =>
+    p.active ? byId[activeIds[ai++]] : p
+  );
+
+  renderProcessorOrder();
+  renderProcessorList();
+  sendMessage({
+    type: "reorder_processors",
+    order: STATE.processors.map((p) => p.id),
+  });
+
+  // Reflect the new order immediately if processors were already run.
+  if (STATE.results.length > 0) runProcessors();
 }
 
 async function newProcessor() {
@@ -1135,7 +1383,7 @@ function saveProcessor() {
 
   // Validate the code compiles before saving so users get immediate feedback.
   try {
-    new Function("image", code);
+    new Function(...PROCESSOR_ARG_NAMES, code);
   } catch (e) {
     setEditorMessage(`Syntax error: ${e.message}`, "error");
     return;
@@ -1183,6 +1431,34 @@ function toggleProcessorActive(p) {
 
 // ---- Running processors against all images ----
 
+// Convert a raw person ({ keypoints: [{ name, x, y, confidence }] }) into the
+// nested o_person shape processors see, e.g. o_person.o_wrist.o_left.n_x.
+// Paired keypoints (left_*/right_*) become { o_left, o_right }; the lone "nose"
+// keypoint sits directly on o_person. A missing keypoint is null.
+function buildPersonObject(person) {
+  const byName = {};
+  for (const k of (person && person.keypoints) || []) byName[k.name] = k;
+
+  const toPoint = (kp) =>
+    kp ? { n_x: kp.x, n_y: kp.y, n_conf: kp.confidence } : null;
+  const pair = (base) => ({
+    o_left: toPoint(byName["left_" + base]),
+    o_right: toPoint(byName["right_" + base]),
+  });
+
+  return {
+    o_nose: toPoint(byName["nose"]),
+    o_eye: pair("eye"),
+    o_ear: pair("ear"),
+    o_shoulder: pair("shoulder"),
+    o_elbow: pair("elbow"),
+    o_wrist: pair("wrist"),
+    o_hip: pair("hip"),
+    o_knee: pair("knee"),
+    o_ankle: pair("ankle"),
+  };
+}
+
 async function runProcessors() {
   if (STATE.runningProcessors) return;
 
@@ -1196,7 +1472,10 @@ async function runProcessors() {
   const compiled = [];
   for (const p of active) {
     try {
-      compiled.push({ name: p.name, fn: new Function("image", p.code) });
+      compiled.push({
+        name: p.name,
+        fn: new Function(...PROCESSOR_ARG_NAMES, p.code),
+      });
     } catch (e) {
       updateFilterStatusText(
         `Processor "${p.name}" has a syntax error: ${e.message}`,
@@ -1259,33 +1538,32 @@ async function handleAllPoseData(msg) {
     const people = (pose && pose.people) ? pose.people : [];
     const dims = dimMap[item.result] || { width: 0, height: 0 };
 
-    const image = {
-      source: item.source,
-      fileName: (item.source || "").split("/").pop() || item.source,
-      status: item.status,
-      errorMsg: item.error_msg,
-      width: dims.width || (pose && pose.image_width) || 0,
-      height: dims.height || (pose && pose.image_height) || 0,
-      people,
-      peopleCount: people.length,
-      pose,
-      keypoint(name, personIndex = 0) {
-        const person = people[personIndex];
-        if (!person || !person.keypoints) return null;
-        return person.keypoints.find((k) => k.name === name) || null;
-      },
+    const a_o_person = people.map(buildPersonObject);
+    const o_img = {
+      s_path_abs: item.source,
+      s_name_file: (item.source || "").split("/").pop() || item.source,
+      s_msg_error: item.error_msg || "",
+      n_scl_x: dims.width || (pose && pose.image_width) || 0,
+      n_scl_y: dims.height || (pose && pose.image_height) || 0,
+      n_persons: a_o_person.length,
+      a_o_person,
     };
+
+    const procArgs = processorArgs(o_img, pose);
 
     let keep = true;
     let reason = "";
     for (const proc of compiled) {
       let result;
       try {
-        result = proc.fn(image);
+        result = proc.fn(...procArgs);
       } catch (e) {
         errors++;
         // A throwing processor neither keeps nor filters; record and continue.
-        console.error(`Processor "${proc.name}" threw on ${image.fileName}:`, e);
+        console.error(
+          `Processor "${proc.name}" threw on ${o_img.s_name_file}:`,
+          e,
+        );
         continue;
       }
       if (!result) {

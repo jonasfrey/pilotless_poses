@@ -105,6 +105,18 @@
           </div>
         </aside>
 
+        <!-- Active processor pipeline (drag to reorder) -->
+        <aside class="processor-order-sidebar" id="processor-order-sidebar">
+          <div class="sidebar-header">
+            <h3>Pipeline</h3>
+            <span id="processor-order-count" class="badge">0</span>
+          </div>
+          <p class="hint pipeline-hint">Active processors, applied top to bottom. Drag to reorder.</p>
+          <div id="processor-order-list" class="processor-order-list">
+            <div class="placeholder">No active processors.</div>
+          </div>
+        </aside>
+
         <!-- Canvas viewer -->
         <div class="viewer-area" id="viewer-area">
           <div class="viewer-placeholder" id="viewer-placeholder">
@@ -182,13 +194,13 @@
             </div>
 
             <p class="hint editor-hint">
-              Write a JavaScript function body. The argument <code>image</code> holds the image and
+              Write a JavaScript function body. The argument <code>o_img</code> holds the image and
               its pose data. <strong>Return false</strong> (or any falsy value) to filter the image
               out of the preview; return true to keep it.
             </p>
 
             <div class="editor-fields">
-              <span class="editor-signature">function (image) {</span>
+              <span class="editor-signature">function (o_img, f_deno_write_file, f_save_image, f_save_json, f_save_filtered) {</span>
               <div id="monaco-editor" class="monaco-editor-host"></div>
               <span class="editor-signature">}</span>
             </div>
@@ -202,15 +214,31 @@
             </div>
 
             <details class="processor-help">
-              <summary>What's available on <code>image</code>?</summary>
+              <summary>What's available on <code>o_img</code>?</summary>
               <ul>
-                <li><code>image.source</code> — full path to the source image</li>
-                <li><code>image.fileName</code> — just the file name</li>
-                <li><code>image.width</code>, <code>image.height</code> — pixel dimensions</li>
-                <li><code>image.peopleCount</code> — number of detected people</li>
-                <li><code>image.people</code> — array of <code>{ id, keypoints: [{ name, x, y, confidence }] }</code></li>
-                <li><code>image.pose</code> — the full raw pose JSON</li>
-                <li><code>image.keypoint(name, personIndex = 0)</code> — helper to fetch one keypoint</li>
+                <li><code>o_img.s_path_abs</code> — absolute path to the source image</li>
+                <li><code>o_img.s_name_file</code> — just the file name</li>
+                <li><code>o_img.s_msg_error</code> — error message if inference failed</li>
+                <li><code>o_img.n_scl_x</code>, <code>o_img.n_scl_y</code> — image width / height in pixels</li>
+                <li><code>o_img.n_persons</code> — number of detected people (<code>= o_img.a_o_person.length</code>)</li>
+                <li><code>o_img.a_o_person</code> — array of person objects (<code>o_person</code>)</li>
+              </ul>
+              <p>Each <code>o_person</code> has keypoints grouped by body part. Paired
+              parts expose <code>o_left</code> / <code>o_right</code>; the nose sits
+              directly on the person:</p>
+              <ul>
+                <li><code>o_person.o_nose</code></li>
+                <li><code>o_person.o_eye</code>, <code>o_ear</code>, <code>o_shoulder</code>, <code>o_elbow</code>, <code>o_wrist</code>, <code>o_hip</code>, <code>o_knee</code>, <code>o_ankle</code> — each with <code>.o_left</code> and <code>.o_right</code></li>
+                <li>Every point is <code>{ n_x, n_y, n_conf }</code>, e.g. <code>o_person.o_wrist.o_left.n_x</code> (or <code>null</code> if the keypoint is absent)</li>
+              </ul>
+              <p>You also receive these file helpers (all return a Promise
+              resolving to whether the write succeeded; paths are relative to the
+              server working directory):</p>
+              <ul>
+                <li><code>f_save_image(dir)</code> — copy this image into <code>dir</code></li>
+                <li><code>f_save_json(dir)</code> — write this image's pose JSON into <code>dir</code> as <code>&lt;name&gt;_pose.json</code></li>
+                <li><code>f_save_filtered(dir)</code> — do both (image + pose JSON)</li>
+                <li><code>f_deno_write_file(path, data)</code> — low-level <code>Deno.writeFile</code> proxy; <code>data</code> may be a string, <code>Uint8Array</code>, <code>ArrayBuffer</code>, or <code>number[]</code></li>
               </ul>
             </details>
           </div>

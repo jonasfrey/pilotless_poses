@@ -29,3 +29,6 @@ testimages/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Images exported by the save_images processor
+filtered_images/

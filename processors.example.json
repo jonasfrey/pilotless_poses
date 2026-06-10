@@ -1,0 +1,18 @@
+[
+  {
+    "id": "example-hands_in_air",
+    "name": "hands_in_air",
+    "code": "// Keep images where a person has a hand in the air (a wrist positioned above\n// the corresponding shoulder); filter out images where nobody raised a hand.\n// Image y grows downward, so \"above\" means a smaller y value.\nconst MIN_CONF = 0.3;\nfor (let i = 0; i < o_img.a_o_person.length; i++) {\n  const o_person = o_img.a_o_person[i];\n  const sides = [\n    [\"left\", o_person.o_wrist.o_left, o_person.o_shoulder.o_left],\n    [\"right\", o_person.o_wrist.o_right, o_person.o_shoulder.o_right],\n  ];\n  for (const [side, o_wrist, o_shoulder] of sides) {\n    if (!o_wrist || !o_shoulder) continue;\n    if (o_wrist.n_conf < MIN_CONF || o_shoulder.n_conf < MIN_CONF) continue;\n    if (o_wrist.n_y < o_shoulder.n_y) {\n      console.log(\n        `[hands_in_air] KEPT \"${o_img.s_name_file}\": person ${i} ${side} ` +\n          `wrist (y=${o_wrist.n_y.toFixed(1)}) is above shoulder ` +\n          `(y=${o_shoulder.n_y.toFixed(1)}) — hand raised by ` +\n          `${(o_shoulder.n_y - o_wrist.n_y).toFixed(1)}px`\n      );\n      return true; // hand in the air — keep this image\n    }\n  }\n}\nconsole.log(\n  `[hands_in_air] FILTERED OUT \"${o_img.s_name_file}\": no raised hands detected`,\n);\nreturn false; // nobody has a hand raised — filter this image out\n",
+    "active": true,
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.000Z"
+  },
+  {
+    "id": "example-save_images",
+    "name": "save_images",
+    "code": "// Save each surviving image and its pose JSON into ./filtered_images, then\n// keep it. Put this processor LAST in the pipeline so only the images that\n// passed the earlier filters get saved.\n//\n// f_save_filtered() copies both the image file and its <name>_pose.json. It's\n// fire-and-forget here: the predicate returns immediately while the copy runs.\nconst DEST_DIR = \"./filtered_images\";\nf_save_filtered(DEST_DIR)\n  .then((ok) =>\n    console.log(\n      ok\n        ? `[save_images] saved \"${o_img.s_name_file}\" + pose JSON -> ${DEST_DIR}`\n        : `[save_images] save incomplete for \"${o_img.s_name_file}\"`,\n    )\n  )\n  .catch((err) =>\n    console.error(`[save_images] failed \"${o_img.s_name_file}\":`, err)\n  );\nreturn true; // never filters — only saves\n",
+    "active": false,
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.000Z"
+  }
+]

@@ -680,6 +680,74 @@ input[type="text"]::placeholder { color: var(--text-muted); }
   border-color: var(--green);
 }
 
+/* Pipeline column (active processors, reorderable) on the preview page */
+.processor-order-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding-right: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.pipeline-hint {
+  margin: 0 0.25rem 0.5rem;
+}
+.processor-order-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.processor-order-list .placeholder {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  padding: 1rem 0.25rem;
+  text-align: center;
+}
+.processor-order-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  cursor: grab;
+  user-select: none;
+}
+.processor-order-entry:active { cursor: grabbing; }
+.processor-order-entry.dragging { opacity: 0.4; }
+.processor-order-entry.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.processor-order-entry.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.processor-order-entry .po-handle {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.processor-order-entry .po-num {
+  flex-shrink: 0;
+  width: 1.3rem;
+  height: 1.3rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+}
+.processor-order-entry .po-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Editor panel */
 .processor-editor-area {
   flex: 1;
@@ -785,6 +853,7 @@ input[type="text"]::placeholder { color: var(--text-muted); }
   .processors-layout { flex-direction: column; }
   .processor-sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; max-height: 220px; }
   .image-sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; max-height: 200px; }
+  .processor-order-sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; max-height: 200px; }
   .form-row { flex-direction: column; }
   .app-header { flex-wrap: wrap; }
   .nav-tabs { margin-left: 0; }

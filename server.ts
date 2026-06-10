@@ -70,9 +70,24 @@ interface DeleteProcessorMessage {
   id: string;
 }
 
+interface ReorderProcessorsMessage {
+  type: "reorder_processors";
+  // Processor ids in the desired application order. Ids not present are kept
+  // in their existing relative order after the listed ones.
+  order: string[];
+}
+
 interface GetAllPoseDataMessage {
   type: "get_all_pose_data";
   folderPath: string;
+}
+
+interface WriteFileMessage {
+  type: "write_file";
+  // Destination path, relative to the server's working directory.
+  path: string;
+  // File contents, base64-encoded (binary-safe).
+  dataBase64: string;
 }
 
 type ClientMessage =
@@ -84,7 +99,9 @@ type ClientMessage =
   | ListProcessorsMessage
   | SaveProcessorMessage
   | DeleteProcessorMessage
-  | GetAllPoseDataMessage;
+  | ReorderProcessorsMessage
+  | GetAllPoseDataMessage
+  | WriteFileMessage;
 
 interface ProgressMessage {
   type: "progress";
@@ -137,6 +154,13 @@ interface ProcessorsListMessage {
   error?: string;
 }
 
+interface WriteFileResultMessage {
+  type: "write_file_result";
+  path: string;
+  ok: boolean;
+  error?: string;
+}
+
 interface AllPoseDataMessage {
   type: "all_pose_data";
   // Keyed by the manifest result path so the client can match against its
@@ -159,7 +183,8 @@ type ServerMessage =
   | ErrorMessage
   | BrowseResultMessage
   | ProcessorsListMessage
-  | AllPoseDataMessage;
+  | AllPoseDataMessage
+  | WriteFileResultMessage;
 
 interface ManifestEntry {
   source: string;
@@ -926,76 +951,157 @@ async function handleBrowseFolder(
 // they survive restarts; the actual execution happens client-side.
 
 const PROCESSORS_PATH = "./processors.json";
+// Committed, version-controlled list of built-in example processors. It is
+// regenerated on startup and always merged into the user's processors so the
+// examples are available in the app even on an existing processors.json.
+const EXAMPLE_PROCESSORS_PATH = "./processors.example.json";
+// Fixed timestamp for the built-in examples so the generated file is stable
+// (no git churn between runs).
+const EXAMPLE_TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
-// Built-in processor seeded on first run. Filters out images where any detected
-// person has a hand raised — a wrist sitting above the matching shoulder. Note
-// the image y-axis grows downward, so "above" means a smaller y value.
+// Built-in example processor (always available). Filters out images where any
+// detected person has a hand raised — a wrist sitting above the matching
+// shoulder. Note the image y-axis grows downward, so "above" means smaller y.
 const HANDS_IN_AIR_CODE =
   `// Keep images where a person has a hand in the air (a wrist positioned above
 // the corresponding shoulder); filter out images where nobody raised a hand.
 // Image y grows downward, so "above" means a smaller y value.
 const MIN_CONF = 0.3;
-for (let i = 0; i < image.people.length; i++) {
-  const person = image.people[i];
-  const kp = {};
-  for (const k of person.keypoints) kp[k.name] = k;
-  const pairs = [
-    ["left_wrist", "left_shoulder"],
-    ["right_wrist", "right_shoulder"],
+for (let i = 0; i < o_img.a_o_person.length; i++) {
+  const o_person = o_img.a_o_person[i];
+  const sides = [
+    ["left", o_person.o_wrist.o_left, o_person.o_shoulder.o_left],
+    ["right", o_person.o_wrist.o_right, o_person.o_shoulder.o_right],
   ];
-  for (const [wristName, shoulderName] of pairs) {
-    const wrist = kp[wristName];
-    const shoulder = kp[shoulderName];
-    if (!wrist || !shoulder) continue;
-    if (wrist.confidence < MIN_CONF || shoulder.confidence < MIN_CONF) continue;
-    if (wrist.y < shoulder.y) {
+  for (const [side, o_wrist, o_shoulder] of sides) {
+    if (!o_wrist || !o_shoulder) continue;
+    if (o_wrist.n_conf < MIN_CONF || o_shoulder.n_conf < MIN_CONF) continue;
+    if (o_wrist.n_y < o_shoulder.n_y) {
       console.log(
-        \`[hands_in_air] KEPT "\${image.fileName}": person \${i} \` +
-          \`\${wristName} (y=\${wrist.y.toFixed(1)}) is above \${shoulderName} \` +
-          \`(y=\${shoulder.y.toFixed(1)}) — hand raised by \` +
-          \`\${(shoulder.y - wrist.y).toFixed(1)}px\`
+        \`[hands_in_air] KEPT "\${o_img.s_name_file}": person \${i} \${side} \` +
+          \`wrist (y=\${o_wrist.n_y.toFixed(1)}) is above shoulder \` +
+          \`(y=\${o_shoulder.n_y.toFixed(1)}) — hand raised by \` +
+          \`\${(o_shoulder.n_y - o_wrist.n_y).toFixed(1)}px\`
       );
       return true; // hand in the air — keep this image
     }
   }
 }
 console.log(
-  \`[hands_in_air] FILTERED OUT "\${image.fileName}": no raised hands detected\`,
+  \`[hands_in_air] FILTERED OUT "\${o_img.s_name_file}": no raised hands detected\`,
 );
 return false; // nobody has a hand raised — filter this image out
 `;
 
-function defaultProcessors(): Processor[] {
-  const now = new Date().toISOString();
+// Built-in processor that copies every image reaching it into ./filtered_images.
+// It keeps all images (always returns true), so place it LAST in the pipeline:
+// then it only sees images that survived the earlier filters. Writing happens
+// through f_deno_write_file, the server-side Deno.writeFile proxy.
+const SAVE_IMAGES_CODE =
+  `// Save each surviving image and its pose JSON into ./filtered_images, then
+// keep it. Put this processor LAST in the pipeline so only the images that
+// passed the earlier filters get saved.
+//
+// f_save_filtered() copies both the image file and its <name>_pose.json. It's
+// fire-and-forget here: the predicate returns immediately while the copy runs.
+const DEST_DIR = "./filtered_images";
+f_save_filtered(DEST_DIR)
+  .then((ok) =>
+    console.log(
+      ok
+        ? \`[save_images] saved "\${o_img.s_name_file}" + pose JSON -> \${DEST_DIR}\`
+        : \`[save_images] save incomplete for "\${o_img.s_name_file}"\`,
+    )
+  )
+  .catch((err) =>
+    console.error(\`[save_images] failed "\${o_img.s_name_file}":\`, err)
+  );
+return true; // never filters — only saves
+`;
+
+// Built-in example processors that ship with the app. Stable ids + fixed
+// timestamps keep the generated processors.example.json deterministic.
+function exampleProcessors(): Processor[] {
   return [
     {
-      id: crypto.randomUUID(),
+      id: "example-hands_in_air",
       name: "hands_in_air",
       code: HANDS_IN_AIR_CODE,
       active: true,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: EXAMPLE_TIMESTAMP,
+      updatedAt: EXAMPLE_TIMESTAMP,
+    },
+    {
+      id: "example-save_images",
+      name: "save_images",
+      code: SAVE_IMAGES_CODE,
+      // Off by default so images aren't written to disk unexpectedly; the user
+      // enables it and orders it last in the pipeline when they want to export.
+      active: false,
+      createdAt: EXAMPLE_TIMESTAMP,
+      updatedAt: EXAMPLE_TIMESTAMP,
     },
   ];
 }
 
+// Write the committed example file from the built-in examples so it always
+// exists and stays in sync with the code. Non-fatal if it can't be written.
+async function ensureExampleProcessorsFile(): Promise<void> {
+  try {
+    await Deno.writeTextFile(
+      EXAMPLE_PROCESSORS_PATH,
+      JSON.stringify(exampleProcessors(), null, 2) + "\n",
+    );
+  } catch (e) {
+    console.warn(`⚠ Could not write ${EXAMPLE_PROCESSORS_PATH}:`, e);
+  }
+}
+
 async function loadProcessors(): Promise<Processor[]> {
+  let userList: Processor[] = [];
+  let existed = true;
   try {
     const raw = await Deno.readTextFile(PROCESSORS_PATH);
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed as Processor[];
-    return [];
+    userList = Array.isArray(parsed) ? parsed as Processor[] : [];
   } catch {
-    // First run — seed the built-in default and persist it so the user can
-    // edit or delete it like any other processor.
-    const seeded = defaultProcessors();
-    try {
-      await saveProcessors(seeded);
-    } catch {
-      // Non-fatal: still return the defaults even if we couldn't write them.
-    }
-    return seeded;
+    existed = false; // first run, or unreadable — start from the examples
   }
+
+  // Refresh the code of built-in examples the user hasn't modified, so
+  // improvements to the built-ins reach existing installs. An example counts as
+  // "unmodified" while its timestamp still equals EXAMPLE_TIMESTAMP (editing it
+  // in the UI bumps updatedAt), so user customizations are never clobbered.
+  const examplesById = new Map(exampleProcessors().map((e) => [e.id, e]));
+  let changed = false;
+  for (const p of userList) {
+    const ex = examplesById.get(p.id);
+    if (ex && p.updatedAt === EXAMPLE_TIMESTAMP && p.code !== ex.code) {
+      p.code = ex.code;
+      p.name = ex.name;
+      changed = true;
+    }
+  }
+
+  // Ensure every built-in example is always available: append any example
+  // whose name isn't already present in the user's list.
+  const names = new Set(userList.map((p) => p.name));
+  let added = false;
+  for (const ex of exampleProcessors()) {
+    if (!names.has(ex.name)) {
+      userList.push(ex);
+      added = true;
+    }
+  }
+
+  if (!existed || added || changed) {
+    try {
+      await saveProcessors(userList);
+    } catch {
+      // Non-fatal: still return the merged list even if we couldn't persist it.
+    }
+  }
+  return userList;
 }
 
 async function saveProcessors(processors: Processor[]): Promise<void> {
@@ -1083,6 +1189,74 @@ async function handleDeleteProcessor(
     connManager.send(ws, {
       type: "processors_list",
       processors: await loadProcessors().catch(() => []),
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+async function handleReorderProcessors(
+  ws: WebSocket,
+  msg: ReorderProcessorsMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  try {
+    const processors = await loadProcessors();
+    const order = Array.isArray(msg.order) ? msg.order : [];
+
+    // Rebuild the list in the requested order; any processor whose id wasn't
+    // listed is appended afterwards, preserving its original relative order.
+    const byId = new Map(processors.map((p) => [p.id, p]));
+    const reordered: Processor[] = [];
+    for (const id of order) {
+      const p = byId.get(id);
+      if (p) {
+        reordered.push(p);
+        byId.delete(id);
+      }
+    }
+    for (const p of byId.values()) reordered.push(p);
+
+    await saveProcessors(reordered);
+    connManager.send(ws, { type: "processors_list", processors: reordered });
+  } catch (e) {
+    connManager.send(ws, {
+      type: "processors_list",
+      processors: await loadProcessors().catch(() => []),
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// Proxy for Deno.writeFile exposed to client-side processors as
+// `f_deno_write_file`. Writes base64-decoded contents to a path relative to the
+// server's working directory, creating parent directories as needed.
+async function handleWriteFile(
+  ws: WebSocket,
+  msg: WriteFileMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  const path = msg.path ?? "";
+  try {
+    // Keep writes inside the working directory: no parent traversal, no
+    // absolute paths.
+    if (!path || path.includes("..") || path.startsWith("/")) {
+      throw new Error(`Refusing to write to unsafe path: "${path}"`);
+    }
+
+    const bin = atob(msg.dataBase64 ?? "");
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+    const dir = path.split("/").slice(0, -1).join("/");
+    if (dir) await Deno.mkdir(dir, { recursive: true });
+    await Deno.writeFile(path, bytes);
+
+    connManager.send(ws, { type: "write_file_result", path, ok: true });
+  } catch (e) {
+    connManager.send(ws, {
+      type: "write_file_result",
+      path,
+      ok: false,
       error: e instanceof Error ? e.message : String(e),
     });
   }
@@ -1260,8 +1434,14 @@ async function handleRequest(
         case "delete_processor":
           await handleDeleteProcessor(socket, msg, connManager);
           break;
+        case "reorder_processors":
+          await handleReorderProcessors(socket, msg, connManager);
+          break;
         case "get_all_pose_data":
           await handleGetAllPoseData(socket, msg, connManager);
+          break;
+        case "write_file":
+          await handleWriteFile(socket, msg, connManager);
           break;
         default:
           connManager.send(socket, {
@@ -1479,6 +1659,9 @@ async function ensurePythonDeps(pythonPath: string): Promise<void> {
 async function main() {
   const config = await loadConfig();
   const connManager = new ConnectionManager();
+
+  // Keep the committed example-processors file in sync with the built-ins.
+  await ensureExampleProcessorsFile();
 
   console.log("=".repeat(60));
   console.log("  Pilotless Poses Server");

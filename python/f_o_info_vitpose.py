@@ -16,6 +16,49 @@ COCO_KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle"
 ]
 
+def select_device():
+    """Pick the inference device, preferring CUDA but degrading gracefully.
+
+    torch.cuda.is_available() can return True on machines where CUDA then fails
+    at runtime with errors like "CUDA driver error: invalid argument" — e.g. a
+    driver/runtime version mismatch or broken GPU passthrough in a container.
+    So we don't just trust is_available(): we run a tiny op on the GPU and only
+    keep CUDA if it actually works, otherwise fall back to CPU.
+
+    Override with the POSE_DEVICE env var ("cpu" or "cuda") to skip detection.
+    """
+    forced = os.environ.get("POSE_DEVICE", "").strip().lower()
+    if forced in ("cpu", "cuda"):
+        if forced == "cuda" and not torch.cuda.is_available():
+            print("POSE_DEVICE=cuda but CUDA is unavailable; using CPU.", file=sys.stderr)
+            return torch.device("cpu")
+        return torch.device(forced)
+
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    # CUDA claims to be available — verify real operations succeed before
+    # committing the whole pipeline to the GPU. Some torch builds (e.g.
+    # 2.12.0+cu130) ship broken reduction/scan kernels: elementwise ops work
+    # but prod()/cumsum() fail with "CUDA driver error: invalid argument",
+    # which then crashes RT-DETR mid-inference. Exercise those ops here so we
+    # detect the broken build up front and fall back to CPU.
+    try:
+        probe = torch.tensor([[2, 3], [4, 5]], device="cuda")
+        _ = probe + 1                 # elementwise
+        _ = probe.prod(1).cumsum(0)   # reduction + scan (the ops RT-DETR needs)
+        torch.cuda.synchronize()
+        return torch.device("cuda")
+    except Exception as exc:
+        print(
+            f"CUDA reported available but failed a test op ({exc}); "
+            "falling back to CPU. This usually means a broken torch CUDA build "
+            "rather than a driver problem. Set POSE_DEVICE=cpu to silence this.",
+            file=sys.stderr,
+        )
+        return torch.device("cpu")
+
+
 def process_image(image_path, person_processor, person_model, pose_processor, pose_model, device):
     """Process a single image and return pose data"""
     
@@ -149,7 +192,7 @@ def main():
     # Print to stderr so it doesn't interfere with JSON output
     print(f"Processing {len(image_path)} images...", file=sys.stderr)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device()
     print(f"Using device: {device}", file=sys.stderr)
 
     # Load models ONCE
