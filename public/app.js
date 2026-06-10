@@ -319,6 +319,9 @@ function handleMessage(msg) {
     case "write_file_result":
       handleWriteFileResult(msg);
       break;
+    case "scan_log":
+      handleScanLog(msg);
+      break;
     case "error":
       handleError(msg);
       break;
@@ -353,6 +356,7 @@ function handleBatchComplete(msg) {
   STATE.scanning = false;
   STATE.errors = msg.errors || [];
   updateScanButtons(false);
+  setLogStatus("idle");
 
   if (DOM.progressSummary) {
     const ok = msg.total - STATE.errors.length;
@@ -380,6 +384,79 @@ function handleError(msg) {
   console.error("Server error:", msg.message);
   if (STATE.scanning) {
     addLogEntry({ file: msg.message, status: "error", error: msg.message });
+  }
+  // Surface server errors on the live log too, even outside an active scan.
+  appendLogLine({ level: "error", line: msg.message });
+}
+
+// ============================================================================
+// Live Log Page
+// ============================================================================
+
+function initLogPage() {
+  DOM.liveLog = document.getElementById("live-log");
+  DOM.logStatus = document.getElementById("log-status");
+  DOM.logAutoscroll = document.getElementById("chk-log-autoscroll");
+  DOM.btnClearLog = document.getElementById("btn-clear-log");
+
+  if (DOM.btnClearLog) DOM.btnClearLog.addEventListener("click", clearLog);
+}
+
+function setLogStatus(state) {
+  // state: "running" | "idle"
+  if (!DOM.logStatus) return;
+  const running = state === "running";
+  DOM.logStatus.textContent = running ? "● Scan running" : "Idle";
+  DOM.logStatus.classList.toggle("running", running);
+  DOM.logStatus.classList.toggle("idle", !running);
+  // Pulse the nav tab while a scan is live so the activity is visible from any page.
+  const tab = document.getElementById("nav-log");
+  if (tab) tab.classList.toggle("live", running);
+}
+
+function clearLog() {
+  if (!DOM.liveLog) return;
+  DOM.liveLog.innerHTML =
+    '<div class="live-log-placeholder">Log cleared.</div>';
+}
+
+function handleScanLog(msg) {
+  appendLogLine(msg);
+}
+
+function appendLogLine(msg) {
+  if (!DOM.liveLog) return;
+
+  const placeholder = DOM.liveLog.querySelector(".live-log-placeholder");
+  if (placeholder) placeholder.remove();
+
+  const level = msg.level || "info";
+  const row = document.createElement("div");
+  row.className = `live-log-line level-${level}`;
+
+  const timeEl = document.createElement("span");
+  timeEl.className = "log-time";
+  const d = msg.ts ? new Date(msg.ts) : new Date();
+  timeEl.textContent = isNaN(d.getTime())
+    ? ""
+    : d.toLocaleTimeString([], { hour12: false });
+
+  const textEl = document.createElement("span");
+  textEl.className = "log-text";
+  textEl.textContent = msg.line ?? "";
+
+  row.appendChild(timeEl);
+  row.appendChild(textEl);
+  DOM.liveLog.appendChild(row);
+
+  // Cap the DOM size so a huge download log doesn't grow unbounded.
+  const MAX_LINES = 2000;
+  while (DOM.liveLog.childElementCount > MAX_LINES) {
+    DOM.liveLog.firstElementChild.remove();
+  }
+
+  if (!DOM.logAutoscroll || DOM.logAutoscroll.checked) {
+    DOM.liveLog.scrollTop = DOM.liveLog.scrollHeight;
   }
 }
 
@@ -463,6 +540,7 @@ function startScan() {
   if (DOM.progressText) DOM.progressText.textContent = "0 / 0";
   if (DOM.progressSummary) DOM.progressSummary.textContent = "";
   if (DOM.fileLog) DOM.fileLog.innerHTML = "";
+  if (DOM.liveLog) DOM.liveLog.innerHTML = "";
 
   const sent = sendMessage({
     type: "scan_folder",
@@ -475,13 +553,20 @@ function startScan() {
     alert("WebSocket not connected. Please wait for reconnection and try again.");
     STATE.scanning = false;
     updateScanButtons(false);
+    return;
   }
+
+  // Surface live server activity: mark the log running and jump to it so the
+  // user sees what's happening during the (potentially long) scan.
+  setLogStatus("running");
+  navigateTo("log");
 }
 
 function cancelScan() {
   sendMessage({ type: "cancel_scan" });
   STATE.scanning = false;
   updateScanButtons(false);
+  setLogStatus("idle");
 }
 
 function addLogEntry(entry) {
@@ -1818,6 +1903,7 @@ function escapeHtml(str) {
 document.addEventListener("DOMContentLoaded", () => {
   loadState();
   initScanPage();
+  initLogPage();
   initPreviewPage();
   initProcessorsPage();
   initFileBrowser();

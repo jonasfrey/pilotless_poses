@@ -141,6 +141,16 @@ interface ErrorMessage {
   message: string;
 }
 
+interface ScanLogMessage {
+  type: "scan_log";
+  // "info"   — server lifecycle events (scan started, N images found, …)
+  // "python" — a line streamed live from the Python inference process's stderr
+  // "error"  — something went wrong
+  level: "info" | "python" | "error";
+  line: string;
+  ts: string;
+}
+
 interface BrowseResultMessage {
   type: "browse_result";
   path: string;
@@ -186,7 +196,8 @@ type ServerMessage =
   | BrowseResultMessage
   | ProcessorsListMessage
   | AllPoseDataMessage
-  | WriteFileResultMessage;
+  | WriteFileResultMessage
+  | ScanLogMessage;
 
 interface ManifestEntry {
   source: string;
@@ -423,6 +434,7 @@ async function runPythonBatchInference(
   imagePaths: string[],
   modelDir: string,
   signal?: AbortSignal,
+  onLog?: (line: string) => void,
 ): Promise<VitPoseBatchOutput> {
   const args = [
     "python/f_o_info_vitpose.py",
@@ -437,9 +449,42 @@ async function runPythonBatchInference(
     signal,
   });
 
-  const { code, stdout, stderr } = await command.output();
-  const stdoutText = new TextDecoder().decode(stdout);
-  const stderrText = new TextDecoder().decode(stderr);
+  const child = command.spawn();
+
+  // stdout carries the final JSON result — collect it in full.
+  const stdoutPromise = new Response(child.stdout).text();
+
+  // stderr carries human-readable progress (model loading, per-image lines,
+  // download progress). Stream it line-by-line so the client sees activity in
+  // real time instead of one buffered dump when the process exits. We also keep
+  // the lines around for error reporting on a non-zero exit.
+  const stderrLines: string[] = [];
+  const stderrDone = (async () => {
+    const decoder = new TextDecoder();
+    let buf = "";
+    for await (const chunk of child.stderr) {
+      buf += decoder.decode(chunk, { stream: true });
+      // Split on newlines AND carriage returns so tqdm-style progress bars,
+      // which rewrite the current line with \r, surface as they update.
+      const parts = buf.split(/\r\n|\r|\n/);
+      buf = parts.pop() ?? "";
+      for (const line of parts) {
+        if (!line.length) continue;
+        stderrLines.push(line);
+        if (line.trim()) onLog?.(line);
+      }
+    }
+    buf += decoder.decode();
+    if (buf.length) {
+      stderrLines.push(buf);
+      if (buf.trim()) onLog?.(buf);
+    }
+  })();
+
+  const stdoutText = await stdoutPromise;
+  await stderrDone;
+  const { code } = await child.status;
+  const stderrText = stderrLines.join("\n");
 
   if (stderrText) {
     // Show last 2000 chars — that's where the actual error usually is
@@ -561,8 +606,21 @@ async function handleScanFolder(
 ): Promise<void> {
   const { folderPath, extensions, outputDir: outputDirRaw } = msg;
 
+  // Stream a line to the client's Live Log page.
+  const log = (line: string, level: "info" | "python" | "error" = "info") => {
+    connManager.send(ws, {
+      type: "scan_log",
+      level,
+      line,
+      ts: new Date().toISOString(),
+    });
+  };
+
+  log(`▶ Scan requested: ${folderPath} (extensions: ${extensions.join(", ")})`);
+
   // Validate folder
   if (!(await isDirectory(folderPath))) {
+    log(`Folder not found or not a directory: ${folderPath}`, "error");
     connManager.send(ws, {
       type: "error",
       message: `Folder not found or not a directory: ${folderPath}`,
@@ -582,15 +640,19 @@ async function handleScanFolder(
 
   try {
     // Scan for images
+    log(`Scanning ${folderPath} for images…`);
     const images = await scanImages(folderPath, extensions);
 
     if (images.length === 0) {
+      log(`No images found matching ${extensions.join(", ")}`, "error");
       connManager.send(ws, {
         type: "error",
         message: `No images found in ${folderPath} matching ${extensions.join(", ")}`,
       });
       return;
     }
+
+    log(`Found ${images.length} image(s). Output dir: ${outputDir}`);
 
     // Ensure output directory exists
     await ensureDir(outputDir);
@@ -643,14 +705,20 @@ async function handleScanFolder(
       // Call the VitPose batch script — processes all images in one invocation
       // (models are loaded once, then all images processed sequentially)
       const modelDir = config.modelDir || "./models";
+      log("Launching VitPose inference (this can take a while on first run)…");
       const batchOutput = await runPythonBatchInference(
         config.pythonPath,
         images,
         modelDir,
         abortController.signal,
+        (line) => log(line, "python"),
       );
 
       if (abortController.signal.aborted) return;
+
+      log(
+        `Inference finished: ${batchOutput.successful} ok, ${batchOutput.failed} failed`,
+      );
 
       // Distribute results to per-image files and send progress
       for (const result of batchOutput.results) {
@@ -711,6 +779,7 @@ async function handleScanFolder(
     } catch (e) {
       if (abortController.signal.aborted) return;
       const errorMsg = e instanceof Error ? e.message : String(e);
+      log(`Inference failed: ${errorMsg}`, "error");
 
       // Mark all remaining images as errored
       for (const imagePath of images) {
@@ -737,9 +806,14 @@ async function handleScanFolder(
 
     // Save manifest
     await saveManifest(outputDir, manifest);
+    log(`Saved results + manifest to ${outputDir}`);
 
     // Send batch complete
     if (!abortController.signal.aborted) {
+      log(
+        `✓ Scan complete: ${images.length - scanState.errors.length} of ` +
+          `${images.length} succeeded, ${scanState.errors.length} error(s)`,
+      );
       connManager.send(ws, {
         type: "batch_complete",
         total: images.length,
@@ -750,9 +824,11 @@ async function handleScanFolder(
     connManager.clearScanState(ws);
   } catch (e) {
     if (!abortController.signal.aborted) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      log(`Scan failed: ${errorMsg}`, "error");
       connManager.send(ws, {
         type: "error",
-        message: `Scan failed: ${e instanceof Error ? e.message : String(e)}`,
+        message: `Scan failed: ${errorMsg}`,
       });
     }
     connManager.clearScanState(ws);
@@ -1416,6 +1492,12 @@ async function handleRequest(
           if (state) {
             state.abortController.abort();
             connManager.clearScanState(socket);
+            connManager.send(socket, {
+              type: "scan_log",
+              level: "error",
+              line: "■ Scan cancelled by user.",
+              ts: new Date().toISOString(),
+            });
             connManager.send(socket, {
               type: "batch_complete",
               total: state.total,

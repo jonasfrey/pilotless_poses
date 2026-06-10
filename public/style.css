@@ -342,6 +342,98 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 .log-entry .filename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-entry .error-msg { color: var(--red); font-size: 0.7rem; }
 
+/* ---- Live Log Page ---- */
+.live-log-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.25rem;
+}
+.live-log-header h2 { margin: 0; }
+.live-log-controls {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.autoscroll-control {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.log-status {
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.log-status.idle { color: var(--text-muted); }
+.log-status.running {
+  color: var(--green);
+  border-color: var(--green-dim);
+  background: rgba(67, 217, 163, 0.08);
+  animation: log-pulse 1.4s ease-in-out infinite;
+}
+@keyframes log-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+/* Pulse the nav tab while a scan is live. */
+.nav-tab.live:not(.active) {
+  border-color: var(--green-dim);
+  color: var(--green);
+}
+.nav-tab.live::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  vertical-align: middle;
+  animation: log-pulse 1.4s ease-in-out infinite;
+}
+
+.live-log {
+  margin-top: 0.75rem;
+  height: 60vh;
+  min-height: 280px;
+  overflow-y: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.live-log-placeholder {
+  color: var(--text-muted);
+  padding: 1rem;
+  text-align: center;
+}
+.live-log-line {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.1rem 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.live-log-line:nth-child(even) { background: rgba(255,255,255,0.02); }
+.live-log-line .log-time {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  user-select: none;
+}
+.live-log-line .log-text { flex: 1; }
+.live-log-line.level-info  .log-text { color: var(--text-secondary); }
+.live-log-line.level-python .log-text { color: var(--text-primary); }
+.live-log-line.level-error .log-text { color: var(--red); }
+
 /* ---- Preview Layout ---- */
 /* The preview page fills the viewport so the image viewer uses all available
    space. Each level passes its height down with flex + min-height:0. */

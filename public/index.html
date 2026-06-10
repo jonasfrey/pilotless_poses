@@ -12,6 +12,7 @@
     <span class="subtitle">Batch Pose Detection with VitPose</span>
     <nav class="nav-tabs">
       <button id="nav-scan"  class="nav-tab active" data-page="scan">Folder Scan</button>
+      <button id="nav-log" class="nav-tab" data-page="log">Live Log</button>
       <button id="nav-preview" class="nav-tab" data-page="preview">Pose Preview</button>
       <button id="nav-processors" class="nav-tab" data-page="processors">Processors</button>
     </nav>
@@ -79,7 +80,33 @@
   </main>
 
   <!-- ================================================================== -->
-  <!-- Page 2: Pose Preview                                                -->
+  <!-- Page 2: Live Log                                                    -->
+  <!-- ================================================================== -->
+  <main id="page-log" class="page">
+    <section class="card live-log-card">
+      <div class="live-log-header">
+        <h2>Live Server Log</h2>
+        <span id="log-status" class="log-status idle">Idle</span>
+        <div class="live-log-controls">
+          <label class="autoscroll-control" title="Keep scrolling to the newest line">
+            <input type="checkbox" id="chk-log-autoscroll" checked> Auto-scroll
+          </label>
+          <button id="btn-clear-log" class="btn btn-secondary btn-sm">Clear</button>
+        </div>
+      </div>
+      <p class="hint">
+        Real-time output from the server while a scan runs — folder scanning,
+        model loading, and per-image inference progress streamed straight from
+        the Python process.
+      </p>
+      <div id="live-log" class="live-log">
+        <div class="live-log-placeholder">No activity yet. Start a scan to see live progress.</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- Page 3: Pose Preview                                                -->
   <!-- ================================================================== -->
   <main id="page-preview" class="page">
     <section class="card" id="preview-main">
@@ -158,7 +185,7 @@
   </main>
 
   <!-- ================================================================== -->
-  <!-- Page 3: Processors                                                  -->
+  <!-- Page 4: Processors                                                  -->
   <!-- ================================================================== -->
   <main id="page-processors" class="page">
     <section class="card" id="processors-main">
