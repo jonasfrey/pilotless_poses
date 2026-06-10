@@ -5,6 +5,8 @@
 // communication, and spawns Python child processes for VitPose inference.
 // ============================================================================
 
+import { ensureDependencies } from "./setup.ts";
+
 // ---- Types ------------------------------------------------------------------
 
 interface AppConfig {
@@ -1472,188 +1474,6 @@ async function handleRequest(
   return await serveStatic(url);
 }
 
-// ---- Dependency Management --------------------------------------------------
-
-async function runPythonScript(
-  pythonPath: string,
-  code: string,
-): Promise<{ ok: boolean; output: string }> {
-  try {
-    const cmd = new Deno.Command(pythonPath, {
-      args: ["-c", code],
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const { code: exitCode, stdout, stderr } = await cmd.output();
-    const text = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
-    return { ok: exitCode === 0, output: text.trim() };
-  } catch {
-    return { ok: false, output: "Failed to run Python" };
-  }
-}
-
-async function isPipPackageInstalled(
-  pythonPath: string,
-  pkg: string,
-): Promise<boolean> {
-  // Check via pip list (fast and reliable)
-  const { ok, output } = await runPythonScript(
-    pythonPath,
-    `import importlib.metadata; print(importlib.metadata.version("${pkg}"))`,
-  );
-  if (ok) return true;
-
-  // Fallback: try importing it
-  const { ok: importOk } = await runPythonScript(
-    pythonPath,
-    `import ${pkg.replace(/-/g, "_")}`,
-  );
-  return importOk;
-}
-
-const REQUIREMENTS_FILE = "./py-requirements.txt";
-
-/**
- * Ensure a Python virtual environment exists at `venvDir` and return the path
- * to its interpreter. The venv isolates project dependencies from the system
- * Python (which on modern distros is PEP 668 "externally managed" and rejects
- * `pip install` without `--break-system-packages`).
- *
- * `basePython` is the system interpreter used to bootstrap the venv.
- * Returns the venv interpreter path, or `null` if the venv could not be created.
- */
-async function hasPip(pythonPath: string): Promise<boolean> {
-  const { ok } = await runPythonScript(pythonPath, "import pip");
-  return ok;
-}
-
-/**
- * Ensure pip exists for `pythonPath`. On Debian/Ubuntu the `ensurepip` module
- * lives in the separate `python3-venv` apt package, so a venv can be created
- * without pip — leaving `python -m pip` to fail with "No module named pip".
- * Recover by seeding pip via `ensurepip`. Returns true if pip is now present.
- */
-async function ensurePip(pythonPath: string): Promise<boolean> {
-  if (await hasPip(pythonPath)) return true;
-
-  console.log("  pip missing — bootstrapping with ensurepip ...");
-  const cmd = new Deno.Command(pythonPath, {
-    args: ["-m", "ensurepip", "--upgrade"],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  await cmd.output();
-
-  return await hasPip(pythonPath);
-}
-
-async function ensureVenv(
-  basePython: string,
-  venvDir: string,
-): Promise<string | null> {
-  const venvPython = `${venvDir}/bin/python`;
-
-  // Reuse an existing venv only if it actually has a working pip; otherwise a
-  // half-built venv (created without ensurepip) would be reused forever.
-  if (await isFile(venvPython)) {
-    if (await ensurePip(venvPython)) {
-      return venvPython;
-    }
-    console.warn(
-      `  ⚠ Existing venv at ${venvDir} has no pip and could not be repaired. ` +
-        `Recreating it.`,
-    );
-    await Deno.remove(venvDir, { recursive: true }).catch(() => {});
-  }
-
-  console.log(`Creating virtual environment at ${venvDir} ...`);
-  const cmd = new Deno.Command(basePython, {
-    args: ["-m", "venv", venvDir],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  const { code } = await cmd.output();
-
-  if (code !== 0 || !(await isFile(venvPython))) {
-    console.error(
-      `  ⚠ Failed to create virtual environment with "${basePython}". ` +
-        `Ensure the venv module is available (e.g. apt install python3-venv).`,
-    );
-    return null;
-  }
-
-  // A fresh venv should already have pip, but on systems where ensurepip is
-  // unavailable it won't — try to recover before giving up.
-  if (!(await ensurePip(venvPython))) {
-    console.error(
-      `  ⚠ Virtual environment was created but pip is unavailable. ` +
-        `Install the ensurepip module (e.g. apt install python3-venv) and retry.`,
-    );
-    return null;
-  }
-
-  // Make sure pip itself is up to date inside the fresh venv.
-  const upgrade = new Deno.Command(venvPython, {
-    args: ["-m", "pip", "install", "--upgrade", "pip"],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  await upgrade.output();
-
-  return venvPython;
-}
-
-async function pipInstallRequirements(
-  pythonPath: string,
-  requirementsFile: string,
-): Promise<boolean> {
-  console.log(`  pip install -r ${requirementsFile} ...`);
-
-  // Inside a venv no --break-system-packages flag is needed.
-  const cmd = new Deno.Command(pythonPath, {
-    args: ["-m", "pip", "install", "-r", requirementsFile],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  const { code } = await cmd.output();
-  return code === 0;
-}
-
-async function ensurePythonDeps(pythonPath: string): Promise<void> {
-  console.log("Checking Python dependencies...");
-
-  // Python packages required by python/f_o_info_vitpose.py
-  const PIP_PACKAGES = [
-    { name: "torch", import: "torch" },
-    { name: "transformers", import: "transformers" },
-    { name: "numpy", import: "numpy" },
-    { name: "Pillow", import: "PIL" },
-    { name: "supervision", import: "supervision" },
-  ];
-
-  let anyMissing = false;
-  for (const pkg of PIP_PACKAGES) {
-    const installed = await isPipPackageInstalled(pythonPath, pkg.import);
-    if (installed) {
-      console.log(`  ✓ ${pkg.name}`);
-    } else {
-      console.log(`  ✗ ${pkg.name} (missing)`);
-      anyMissing = true;
-    }
-  }
-
-  if (anyMissing) {
-    // Install the full pinned set from the requirements file so versions stay
-    // consistent rather than pulling whatever "latest" resolves to.
-    const ok = await pipInstallRequirements(pythonPath, REQUIREMENTS_FILE);
-    if (!ok) {
-      console.warn("  ⚠ Some pip packages may not have installed correctly.");
-    }
-  }
-
-  console.log("");
-}
-
 // ---- Main -------------------------------------------------------------------
 
 async function main() {
@@ -1673,45 +1493,18 @@ async function main() {
   console.log("=".repeat(60));
   console.log("");
 
-  // Check Python is available
-  let pythonOk = false;
+  // Check and install every dependency (Deno → Python → venv → pip packages)
+  // before serving. If the environment can't be made to work, abort instead of
+  // starting in a broken state.
   try {
-    const cmd = new Deno.Command(config.pythonPath, {
-      args: ["--version"],
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const { code, stdout, stderr } = await cmd.output();
-    const ver = new TextDecoder().decode(stdout) ||
-      new TextDecoder().decode(stderr);
-    if (code === 0) {
-      console.log(`✓ Python found: ${ver.trim()}`);
-      pythonOk = true;
-    } else {
-      console.warn(
-        `⚠ Python check returned code ${code}. Edit ${CONFIG_PATH} if needed.`,
-      );
-    }
-  } catch {
-    console.warn(
-      `⚠ Could not run "${config.pythonPath}". ` +
-        `Edit ${CONFIG_PATH} to set the correct Python path.`,
+    config.pythonPath = await ensureDependencies(config.pythonPath, config.venvDir);
+    console.log(`✓ Using Python: ${config.pythonPath}`);
+  } catch (e) {
+    console.error(`\n✗ ${e instanceof Error ? e.message : e}`);
+    console.error(
+      "  Fix the dependency above (or run `deno task setup`) and start again.",
     );
-  }
-
-  // Bootstrap an isolated virtual environment and route all inference through
-  // it, so we never touch the (externally-managed) system Python.
-  if (pythonOk) {
-    const venvPython = await ensureVenv(config.pythonPath, config.venvDir);
-    if (venvPython) {
-      config.pythonPath = venvPython;
-      console.log(`✓ Using virtual environment: ${venvPython}`);
-    } else {
-      console.warn(
-        "⚠ Falling back to system Python — dependency install may fail.",
-      );
-    }
-    await ensurePythonDeps(config.pythonPath);
+    Deno.exit(1);
   }
 
   // Start server
