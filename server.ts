@@ -1342,14 +1342,48 @@ const REQUIREMENTS_FILE = "./py-requirements.txt";
  * `basePython` is the system interpreter used to bootstrap the venv.
  * Returns the venv interpreter path, or `null` if the venv could not be created.
  */
+async function hasPip(pythonPath: string): Promise<boolean> {
+  const { ok } = await runPythonScript(pythonPath, "import pip");
+  return ok;
+}
+
+/**
+ * Ensure pip exists for `pythonPath`. On Debian/Ubuntu the `ensurepip` module
+ * lives in the separate `python3-venv` apt package, so a venv can be created
+ * without pip — leaving `python -m pip` to fail with "No module named pip".
+ * Recover by seeding pip via `ensurepip`. Returns true if pip is now present.
+ */
+async function ensurePip(pythonPath: string): Promise<boolean> {
+  if (await hasPip(pythonPath)) return true;
+
+  console.log("  pip missing — bootstrapping with ensurepip ...");
+  const cmd = new Deno.Command(pythonPath, {
+    args: ["-m", "ensurepip", "--upgrade"],
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  await cmd.output();
+
+  return await hasPip(pythonPath);
+}
+
 async function ensureVenv(
   basePython: string,
   venvDir: string,
 ): Promise<string | null> {
   const venvPython = `${venvDir}/bin/python`;
 
+  // Reuse an existing venv only if it actually has a working pip; otherwise a
+  // half-built venv (created without ensurepip) would be reused forever.
   if (await isFile(venvPython)) {
-    return venvPython;
+    if (await ensurePip(venvPython)) {
+      return venvPython;
+    }
+    console.warn(
+      `  ⚠ Existing venv at ${venvDir} has no pip and could not be repaired. ` +
+        `Recreating it.`,
+    );
+    await Deno.remove(venvDir, { recursive: true }).catch(() => {});
   }
 
   console.log(`Creating virtual environment at ${venvDir} ...`);
@@ -1364,6 +1398,16 @@ async function ensureVenv(
     console.error(
       `  ⚠ Failed to create virtual environment with "${basePython}". ` +
         `Ensure the venv module is available (e.g. apt install python3-venv).`,
+    );
+    return null;
+  }
+
+  // A fresh venv should already have pip, but on systems where ensurepip is
+  // unavailable it won't — try to recover before giving up.
+  if (!(await ensurePip(venvPython))) {
+    console.error(
+      `  ⚠ Virtual environment was created but pip is unavailable. ` +
+        `Install the ensurepip module (e.g. apt install python3-venv) and retry.`,
     );
     return null;
   }
