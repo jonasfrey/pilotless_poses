@@ -207,22 +207,27 @@ def main():
 
     print("Models loaded!", file=sys.stderr)
 
-    # Process all images
-    results = []
+    # Process all images, streaming each result to stdout as a single JSON line
+    # (JSONL) the moment it's ready. This lets the server persist results
+    # incrementally, so a crash or page close mid-scan keeps everything done so
+    # far instead of losing the whole batch. A final "summary" line closes it.
+    successful = 0
+    failed = 0
     for idx, s_path_image in enumerate(image_path, 1):
         print(f"Processing {idx}/{len(image_path)}: {s_path_image}", file=sys.stderr)
         result = process_image(s_path_image, person_processor, person_model, pose_processor, pose_model, device)
-        results.append(result)
+        if result["success"]:
+            successful += 1
+        else:
+            failed += 1
+        print(json.dumps({"type": "result", "data": result}), flush=True)
 
-    # Output JSON to stdout
-    output = {
+    print(json.dumps({
+        "type": "summary",
         "total_images": len(image_path),
-        "successful": sum(1 for r in results if r["success"]),
-        "failed": sum(1 for r in results if not r["success"]),
-        "results": results
-    }
-
-    print(json.dumps(output, indent=2))
+        "successful": successful,
+        "failed": failed,
+    }), flush=True)
 
 if __name__ == "__main__":
     main()

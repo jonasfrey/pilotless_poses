@@ -32,3 +32,10 @@ Thumbs.db
 
 # Images exported by the save_images processor
 filtered_images/
+
+# Inference models (user-defined; trained .joblib weights)
+inference_models.json
+inference_models/
+
+# Test data (COCO val2017) downloaded on startup
+testdata/

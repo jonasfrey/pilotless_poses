@@ -26,6 +26,8 @@ const PIP_PACKAGES = [
   { name: "numpy", import: "numpy" },
   { name: "Pillow", import: "PIL" },
   { name: "supervision", import: "supervision" },
+  { name: "scikit-learn", import: "sklearn" },
+  { name: "joblib", import: "joblib" },
 ];
 
 // ---- process helpers --------------------------------------------------------

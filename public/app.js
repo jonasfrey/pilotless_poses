@@ -25,16 +25,32 @@ const STATE = {
   showOverlay: true,
   showLabels: true,
   showInfo: false,
+  showKeypoints: false,  // per-keypoint pixel coordinates in the info overlay
   overlayOpacity: 0.85,
+
+  // Canvas zoom / pan (applied as a CSS transform on the canvas element)
+  view: { scale: 1, tx: 0, ty: 0 },
 
   // Processor state
   processors: [],          // { id, name, code, active, createdAt, updatedAt }
   editingProcessorId: null, // id being edited, or "__new__" for an unsaved one
   filteredOut: {},         // result path -> reason string (image hidden in preview)
   showFiltered: false,     // when true, filtered images stay visible (dimmed)
+  showFailed: false,       // when true, images whose inference failed stay visible
   runningProcessors: false,
   monacoEditor: null,
   monacoLoading: null,     // Promise while Monaco is loading
+
+  // Inference model state
+  inferenceModels: [],         // { id, name, positiveDir, negativeDir, status, metrics, ... }
+  editingInferenceId: null,    // id being edited, or "__new__" for an unsaved one
+  inferenceFilteredOut: {},    // result path -> reason string (hidden by an applied model)
+  appliedInferenceId: null,    // id of the model currently applied in the preview
+  inferenceThreshold: 0.5,     // probability threshold for the preview filter
+  trainingInferenceId: null,   // id currently training (Train button disabled)
+  applyingInference: false,    // true while an apply_inference_model request is in flight
+  dirBrowseTarget: null,       // input id the inline folder browser writes back to
+  dirBrowsePath: "/",          // current path of the inline folder browser
 };
 
 // ---- DOM refs (cached after DOMContentLoaded) --------------------------------
@@ -313,6 +329,15 @@ function handleMessage(msg) {
     case "processors_list":
       handleProcessorsList(msg);
       break;
+    case "inference_models_list":
+      handleInferenceModelsList(msg);
+      break;
+    case "inference_model_trained":
+      handleInferenceModelTrained(msg);
+      break;
+    case "inference_model_applied":
+      handleInferenceModelApplied(msg);
+      break;
     case "all_pose_data":
       handleAllPoseData(msg);
       break;
@@ -321,6 +346,9 @@ function handleMessage(msg) {
       break;
     case "scan_log":
       handleScanLog(msg);
+      break;
+    case "scan_status":
+      handleScanStatus(msg);
       break;
     case "error":
       handleError(msg);
@@ -445,6 +473,39 @@ function handleScanLog(msg) {
   appendLogLine(msg);
 }
 
+// Sent by the server right after a (re)connection. Restores the live log and
+// progress for a scan that may have started before this page was loaded, so a
+// reload mid-scan doesn't show an empty log.
+function handleScanStatus(msg) {
+  // Replace the live log with the server's buffered lines.
+  if (DOM.liveLog && Array.isArray(msg.logs)) {
+    DOM.liveLog.innerHTML = "";
+    if (msg.logs.length === 0) {
+      DOM.liveLog.innerHTML =
+        '<div class="live-log-placeholder">No activity yet. Start a scan to see live progress.</div>';
+    } else {
+      for (const line of msg.logs) appendLogLine(line);
+    }
+  }
+
+  STATE.scanning = !!msg.scanning;
+  STATE.totalFiles = msg.total || 0;
+  STATE.processedFiles = msg.current || 0;
+
+  updateScanButtons(STATE.scanning);
+  setLogStatus(STATE.scanning ? "running" : "idle");
+
+  if (msg.total > 0) {
+    const pct = Math.round((msg.current / msg.total) * 100);
+    if (DOM.progressBar) DOM.progressBar.style.width = `${pct}%`;
+    if (DOM.progressText) DOM.progressText.textContent = `${msg.current} / ${msg.total}`;
+    if (DOM.progressSummary && STATE.scanning) {
+      DOM.progressSummary.textContent =
+        `Scan in progress: ${msg.current} of ${msg.total} processed…`;
+    }
+  }
+}
+
 function appendLogLine(msg) {
   if (!DOM.liveLog) return;
 
@@ -495,16 +556,23 @@ function navigateTo(page) {
   if (tabEl) tabEl.classList.add("active");
 
   // Auto-load results when switching to the preview page. Also refresh the
-  // processor list so the pipeline column reflects current active processors.
+  // processor list so the pipeline column reflects current active processors,
+  // and the inference models so the filter column lists trained models.
   if (page === "preview") {
     loadResults();
     sendMessage({ type: "list_processors" });
+    sendMessage({ type: "list_inference_models" });
   }
 
   // Load processors and bootstrap Monaco when entering the processors page
   if (page === "processors") {
     sendMessage({ type: "list_processors" });
     ensureMonaco();
+  }
+
+  // Load inference models when entering the inference models page
+  if (page === "inference") {
+    sendMessage({ type: "list_inference_models" });
   }
 }
 
@@ -673,6 +741,7 @@ function initPreviewPage() {
   DOM.imageCount = document.getElementById("image-count");
   DOM.btnRunProcessors = document.getElementById("btn-run-processors");
   DOM.chkShowFiltered = document.getElementById("chk-show-filtered");
+  DOM.chkShowFailed = document.getElementById("chk-show-failed");
   DOM.processorFilterStatus = document.getElementById("processor-filter-status");
   DOM.processorOrderList = document.getElementById("processor-order-list");
   DOM.processorOrderCount = document.getElementById("processor-order-count");
@@ -685,6 +754,8 @@ function initPreviewPage() {
   DOM.btnToggleOverlay = document.getElementById("btn-toggle-overlay");
   DOM.btnToggleLabels = document.getElementById("btn-toggle-labels");
   DOM.btnToggleInfo = document.getElementById("btn-toggle-info");
+  DOM.btnToggleKeypoints = document.getElementById("btn-toggle-keypoints");
+  DOM.btnResetView = document.getElementById("btn-reset-view");
   DOM.infoOverlay = document.getElementById("info-overlay");
   DOM.infoOverlayBody = document.getElementById("info-overlay-body");
   DOM.opacitySlider = document.getElementById("opacity-slider");
@@ -696,6 +767,9 @@ function initPreviewPage() {
   DOM.btnToggleOverlay.addEventListener("click", toggleOverlay);
   DOM.btnToggleLabels.addEventListener("click", toggleLabels);
   DOM.btnToggleInfo.addEventListener("click", toggleInfo);
+  DOM.btnToggleKeypoints.addEventListener("click", toggleKeypoints);
+  DOM.btnResetView.addEventListener("click", resetView);
+  initCanvasZoomPan();
   DOM.opacitySlider.addEventListener("input", () => {
     STATE.overlayOpacity = parseFloat(DOM.opacitySlider.value);
     renderPoseCanvas();
@@ -711,6 +785,26 @@ function initPreviewPage() {
     STATE.showFiltered = DOM.chkShowFiltered.checked;
     renderImageList();
   });
+  DOM.chkShowFailed.addEventListener("change", () => {
+    STATE.showFailed = DOM.chkShowFailed.checked;
+    renderImageList();
+  });
+
+  // Inference-model filter column (preview sidebar)
+  DOM.inferenceModelChoices = document.getElementById("inference-model-choices");
+  DOM.inferenceFilterCount = document.getElementById("inference-filter-count");
+  DOM.inferenceThreshold = document.getElementById("inference-threshold");
+  DOM.inferenceThresholdValue = document.getElementById("inference-threshold-value");
+  DOM.btnApplyInference = document.getElementById("btn-apply-inference");
+  DOM.btnClearInference = document.getElementById("btn-clear-inference");
+  DOM.inferenceFilterStatus = document.getElementById("inference-filter-status");
+
+  DOM.inferenceThreshold.addEventListener("input", () => {
+    STATE.inferenceThreshold = parseFloat(DOM.inferenceThreshold.value);
+    DOM.inferenceThresholdValue.textContent = STATE.inferenceThreshold.toFixed(2);
+  });
+  DOM.btnApplyInference.addEventListener("click", applyInferenceModel);
+  DOM.btnClearInference.addEventListener("click", clearInferenceFilter);
 
   // Keyboard shortcuts
   document.addEventListener("keydown", handleKeyboard);
@@ -740,7 +834,18 @@ function loadResults() {
 }
 
 function isFilteredOut(result) {
-  return Object.prototype.hasOwnProperty.call(STATE.filteredOut, result.result);
+  return Object.prototype.hasOwnProperty.call(STATE.filteredOut, result.result) ||
+    Object.prototype.hasOwnProperty.call(STATE.inferenceFilteredOut, result.result);
+}
+
+// Reason an image is hidden by a processor or applied inference model (or "").
+function filterReason(result) {
+  return STATE.filteredOut[result.result] ||
+    STATE.inferenceFilteredOut[result.result] || "";
+}
+
+function isFailed(result) {
+  return result.status !== "ok";
 }
 
 function renderImageList() {
@@ -756,16 +861,23 @@ function renderImageList() {
     return;
   }
 
-  // Apply processor filtering. When showFiltered is off, hidden images are
-  // dropped from the list entirely; when on, they remain but are dimmed.
-  const visible = STATE.results.filter(
-    (r) => STATE.showFiltered || !isFilteredOut(r),
-  );
+  // Visibility rules:
+  //  - Failed images (inference errored) are hidden unless "Show failed" is on.
+  //  - Processor- / inference-filtered images are hidden unless "Show filtered"
+  //    is on (then they remain but are dimmed).
+  const visible = STATE.results.filter((r) => {
+    if (isFailed(r) && !STATE.showFailed) return false;
+    if (isFilteredOut(r) && !STATE.showFiltered) return false;
+    return true;
+  });
 
   console.log(
     `[renderImageList] ${STATE.results.length} total, ${
       Object.keys(STATE.filteredOut).length
-    } filtered out by processors, ${visible.length} visible (showFiltered=${STATE.showFiltered}).`,
+    } filtered by processors, ${
+      Object.keys(STATE.inferenceFilteredOut).length
+    } filtered by inference, ${visible.length} visible ` +
+      `(showFiltered=${STATE.showFiltered}, showFailed=${STATE.showFailed}).`,
   );
 
   DOM.imageCount.textContent = String(visible.length);
@@ -773,7 +885,7 @@ function renderImageList() {
 
   if (visible.length === 0) {
     DOM.imageList.innerHTML =
-      '<div class="placeholder">All images were filtered out by active processors.</div>';
+      '<div class="placeholder">No images to show with the current filters.</div>';
     return;
   }
 
@@ -819,7 +931,7 @@ function renderImageList() {
       const tag = document.createElement("span");
       tag.className = "filter-tag";
       tag.textContent = "filtered";
-      tag.title = STATE.filteredOut[r.result] || "Filtered out by a processor";
+      tag.title = filterReason(r) || "Filtered out";
       info.title = tag.title;
       div.appendChild(thumb);
       div.appendChild(info);
@@ -843,13 +955,26 @@ function updateFilterStatus() {
   if (!el) return;
   const total = STATE.results.length;
   const filtered = STATE.results.filter(isFilteredOut).length;
-  if (filtered === 0) {
+  const failed = STATE.results.filter(isFailed).length;
+
+  const parts = [];
+  if (filtered > 0) {
+    parts.push(
+      `${filtered} of ${total} filtered out` +
+        (STATE.showFiltered ? " (shown, dimmed)" : ""),
+    );
+  }
+  if (failed > 0) {
+    parts.push(
+      `${failed} failed` + (STATE.showFailed ? " (shown)" : " (hidden)"),
+    );
+  }
+
+  if (parts.length === 0) {
     el.textContent = total > 0 ? `${total} image${total !== 1 ? "s" : ""}` : "";
     el.classList.remove("has-filter");
   } else {
-    el.textContent =
-      `${filtered} of ${total} filtered out by processors` +
-      (STATE.showFiltered ? " (shown, dimmed)" : "");
+    el.textContent = parts.join(" · ");
     el.classList.add("has-filter");
   }
 }
@@ -858,6 +983,8 @@ function selectImage(index) {
   STATE.currentResultIndex = index;
   STATE.currentPoseData = null;
   STATE.currentImage = null;
+  // Start each image fitted, not at the previous image's zoom/pan.
+  STATE.view = { scale: 1, tx: 0, ty: 0 };
 
   // Update selection highlight
   document.querySelectorAll(".image-item").forEach((el) => el.classList.remove("active"));
@@ -968,7 +1095,110 @@ function renderPoseCanvas() {
       : `${img.naturalWidth}×${img.naturalHeight}`;
   }
 
+  applyView();
   updateInfoOverlay();
+}
+
+// ---- Canvas zoom & pan ----
+//
+// Zoom/pan is a pure CSS transform on the <canvas> element (the pose pixels are
+// still drawn 1:1, the browser just scales the result). transform-origin stays
+// at the canvas centre; tx/ty are screen-pixel pan offsets.
+
+const VIEW_MIN_SCALE = 0.25;
+const VIEW_MAX_SCALE = 20;
+
+function applyView() {
+  const canvas = DOM.poseCanvas;
+  if (!canvas) return;
+  const { scale, tx, ty } = STATE.view;
+  canvas.style.transformOrigin = "center center";
+  canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  if (DOM.canvasWrap) {
+    DOM.canvasWrap.classList.toggle("zoomed", scale !== 1 || tx !== 0 || ty !== 0);
+  }
+}
+
+function resetView() {
+  STATE.view = { scale: 1, tx: 0, ty: 0 };
+  applyView();
+}
+
+function zoomAt(clientX, clientY, factor) {
+  const canvas = DOM.poseCanvas;
+  if (!canvas || !STATE.currentImage) return;
+  const v = STATE.view;
+  const next = Math.min(VIEW_MAX_SCALE, Math.max(VIEW_MIN_SCALE, v.scale * factor));
+  if (next === v.scale) return;
+
+  // Keep the point under the cursor fixed. Derive the canvas centre in screen
+  // coordinates from its live bounding rect (which already includes the current
+  // transform), then solve for the new translation.
+  const rect = canvas.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  const ux = clientX - centerX + v.tx;
+  const uy = clientY - centerY + v.ty;
+  const ratio = next / v.scale;
+  STATE.view = {
+    scale: next,
+    tx: ux - (ux - v.tx) * ratio,
+    ty: uy - (uy - v.ty) * ratio,
+  };
+  applyView();
+}
+
+function initCanvasZoomPan() {
+  const wrap = DOM.canvasWrap;
+  if (!wrap) return;
+
+  wrap.addEventListener("wheel", (e) => {
+    if (!STATE.currentImage) return;
+    e.preventDefault();
+    // Trackpads send many small deltas; exponentiate for smooth, symmetric zoom.
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    zoomAt(e.clientX, e.clientY, factor);
+  }, { passive: false });
+
+  let panning = false;
+  let lastX = 0;
+  let lastY = 0;
+
+  wrap.addEventListener("pointerdown", (e) => {
+    if (!STATE.currentImage || e.button !== 0) return;
+    panning = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    wrap.classList.add("panning");
+    wrap.setPointerCapture(e.pointerId);
+  });
+  wrap.addEventListener("pointermove", (e) => {
+    if (!panning) return;
+    STATE.view.tx += e.clientX - lastX;
+    STATE.view.ty += e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    applyView();
+  });
+  const endPan = (e) => {
+    if (!panning) return;
+    panning = false;
+    wrap.classList.remove("panning");
+    try { wrap.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  };
+  wrap.addEventListener("pointerup", endPan);
+  wrap.addEventListener("pointercancel", endPan);
+
+  // Double-click toggles between fit (reset) and 2× at the cursor.
+  wrap.addEventListener("dblclick", (e) => {
+    if (!STATE.currentImage) return;
+    e.preventDefault();
+    if (STATE.view.scale !== 1 || STATE.view.tx !== 0 || STATE.view.ty !== 0) {
+      resetView();
+    } else {
+      zoomAt(e.clientX, e.clientY, 2);
+    }
+  });
 }
 
 // ---- Image data overlay ----
@@ -977,34 +1207,52 @@ function toggleInfo() {
   STATE.showInfo = !STATE.showInfo;
   DOM.btnToggleInfo.classList.toggle("btn-active", STATE.showInfo);
   DOM.btnToggleInfo.textContent = STATE.showInfo ? "Hide Info" : "Show Info";
-  DOM.infoOverlay.classList.toggle("hidden", !STATE.showInfo);
-  if (STATE.showInfo) updateInfoOverlay();
+  updateOverlayVisibility();
+}
+
+function toggleKeypoints() {
+  STATE.showKeypoints = !STATE.showKeypoints;
+  DOM.btnToggleKeypoints.classList.toggle("btn-active", STATE.showKeypoints);
+  DOM.btnToggleKeypoints.textContent = STATE.showKeypoints
+    ? "Hide Keypoints"
+    : "Show Keypoints";
+  updateOverlayVisibility();
+}
+
+// The shared overlay is visible when either the summary ("Info") or the
+// per-keypoint coordinate list ("Keypoints") is requested.
+function updateOverlayVisibility() {
+  const show = STATE.showInfo || STATE.showKeypoints;
+  DOM.infoOverlay.classList.toggle("hidden", !show);
+  if (show) updateInfoOverlay();
 }
 
 function updateInfoOverlay() {
   const body = DOM.infoOverlayBody;
-  if (!body || STATE.showInfo === false) return;
+  if (!body || (!STATE.showInfo && !STATE.showKeypoints)) return;
 
   const result = STATE.results[STATE.currentResultIndex];
   const img = STATE.currentImage;
   const pose = STATE.currentPoseData;
   const people = pose && pose.people ? pose.people : [];
 
-  const rows = [];
-  if (result) {
-    rows.push(["File", result.source.split("/").pop() || result.source]);
-    rows.push(["Path", result.source]);
-    rows.push([
-      "Status",
-      result.status === "ok" ? "OK" : (result.error_msg || "Error"),
-    ]);
-  }
-  if (img) rows.push(["Dimensions", `${img.naturalWidth}×${img.naturalHeight}`]);
-  rows.push(["People", String(people.length)]);
-
   let html = "";
-  for (const [k, v] of rows) {
-    html += `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`;
+
+  if (STATE.showInfo) {
+    const rows = [];
+    if (result) {
+      rows.push(["File", result.source.split("/").pop() || result.source]);
+      rows.push(["Path", result.source]);
+      rows.push([
+        "Status",
+        result.status === "ok" ? "OK" : (result.error_msg || "Error"),
+      ]);
+    }
+    if (img) rows.push(["Dimensions", `${img.naturalWidth}×${img.naturalHeight}`]);
+    rows.push(["People", String(people.length)]);
+    for (const [k, v] of rows) {
+      html += `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`;
+    }
   }
 
   people.forEach((p, i) => {
@@ -1014,10 +1262,35 @@ function updateInfoOverlay() {
       ? kpts.reduce((s, kp) => s + kp.confidence, 0) / kpts.length
       : 0;
     html += `<div class="group-label">Person ${i + 1}</div>`;
-    html += `<dt>Keypoints</dt><dd>${kpts.length}</dd>`;
-    html += `<dt>Visible ≥0.3</dt><dd>${visible}</dd>`;
-    html += `<dt>Avg conf</dt><dd>${avg.toFixed(3)}</dd>`;
+    if (STATE.showInfo) {
+      html += `<dt>Keypoints</dt><dd>${kpts.length}</dd>`;
+      html += `<dt>Visible ≥0.3</dt><dd>${visible}</dd>`;
+      html += `<dt>Avg conf</dt><dd>${avg.toFixed(3)}</dd>`;
+    }
+    if (STATE.showKeypoints) {
+      // Per-keypoint pixel coordinates (rounded to whole pixels) and confidence.
+      // Confidence is dotted in its skeleton color so the overlay matches the
+      // canvas: green ≥0.7, yellow 0.3–0.7, red <0.3.
+      for (const kp of kpts) {
+        const label = kp.name.replace(/_/g, " ");
+        const cls = kp.confidence >= 0.7
+          ? "kp-high"
+          : (kp.confidence >= 0.3 ? "kp-mid" : "kp-low");
+        html += `<dt class="kp-name">${escapeHtml(label)}</dt>` +
+          `<dd class="kp-coord ${cls}">` +
+          `${Math.round(kp.x)}, ${Math.round(kp.y)} px ` +
+          `<span class="kp-conf">(${kp.confidence.toFixed(2)})</span></dd>`;
+      }
+    }
   });
+
+  if (STATE.showKeypoints) {
+    html += `<div class="kp-legend">` +
+      `<span class="kp-high">● ≥0.70</span>` +
+      `<span class="kp-mid">● 0.30–0.70</span>` +
+      `<span class="kp-low">● &lt;0.30</span> confidence` +
+      `</div>`;
+  }
 
   body.innerHTML = html || "<dd>No data</dd>";
 }
@@ -1157,6 +1430,14 @@ function handleKeyboard(e) {
     case "i":
       e.preventDefault();
       toggleInfo();
+      break;
+    case "k":
+      e.preventDefault();
+      toggleKeypoints();
+      break;
+    case "0":
+      e.preventDefault();
+      resetView();
       break;
   }
 }
@@ -2006,6 +2287,12 @@ function navigateBrowserTo(page, path) {
 
 // Called from handleMessage when a browse_result arrives
 function handleBrowseResult(data) {
+  // The inference page reuses the folder browser with page="inference".
+  if (data.page === "inference") {
+    handleInferenceBrowseResult(data);
+    return;
+  }
+
   const list = document.getElementById("browser-list-scan");
   if (!list) return;
 
@@ -2112,6 +2399,505 @@ function escapeHtml(str) {
 }
 
 // ============================================================================
+// Page 5: Inference Models (CRUD + training)
+// ============================================================================
+
+function initInferencePage() {
+  DOM.inferenceList = document.getElementById("inference-list");
+  DOM.inferenceCount = document.getElementById("inference-count");
+  DOM.inferenceEditorPlaceholder = document.getElementById("inference-editor-placeholder");
+  DOM.inferenceEditorPanel = document.getElementById("inference-editor-panel");
+  DOM.inferenceName = document.getElementById("inference-name");
+  DOM.inferencePosDir = document.getElementById("inference-pos-dir");
+  DOM.inferenceNegDir = document.getElementById("inference-neg-dir");
+  DOM.inferenceStatusBadge = document.getElementById("inference-status-badge");
+  DOM.inferenceMetrics = document.getElementById("inference-metrics");
+  DOM.inferenceEditorMessage = document.getElementById("inference-editor-message");
+  DOM.btnTrainInference = document.getElementById("btn-train-inference");
+  DOM.btnSaveInference = document.getElementById("btn-save-inference");
+  DOM.btnDeleteInference = document.getElementById("btn-delete-inference");
+  DOM.btnCancelInference = document.getElementById("btn-cancel-inference");
+
+  // Shared inline folder browser
+  DOM.inferenceDirBrowser = document.getElementById("inference-dir-browser");
+  DOM.inferenceBrowsePath = document.getElementById("inference-browse-path");
+  DOM.inferenceBrowserList = document.getElementById("inference-browser-list");
+
+  document.getElementById("btn-new-inference")
+    .addEventListener("click", newInferenceModel);
+  DOM.btnSaveInference.addEventListener("click", () => saveInferenceModel(false));
+  DOM.btnDeleteInference.addEventListener("click", deleteInferenceModel);
+  DOM.btnCancelInference.addEventListener("click", closeInferenceEditor);
+  DOM.btnTrainInference.addEventListener("click", trainInferenceModel);
+
+  // 📁 buttons open the shared folder browser, writing back to their target.
+  document.querySelectorAll(".btn-browse-dir").forEach((btn) => {
+    btn.addEventListener("click", () => openDirBrowser(btn.dataset.target));
+  });
+  document.getElementById("btn-inference-browse-up").addEventListener("click", () => {
+    const parent = parentPath(STATE.dirBrowsePath);
+    if (parent !== null) navigateInferenceBrowserTo(parent);
+  });
+  document.getElementById("btn-inference-browse-use")
+    .addEventListener("click", useDirBrowser);
+}
+
+function handleInferenceModelsList(msg) {
+  STATE.inferenceModels = msg.models || [];
+  if (msg.error) console.error("inference_models error:", msg.error);
+
+  // Resolve a freshly-saved "__new__" model to its concrete id.
+  if (STATE.pendingSelectInferenceName) {
+    const m = STATE.inferenceModels.find(
+      (x) => x.name === STATE.pendingSelectInferenceName,
+    );
+    if (m) {
+      STATE.editingInferenceId = m.id;
+      STATE.pendingSelectInferenceName = null;
+    }
+  }
+
+  // If a save was triggered by Train, kick off training now that we have an id.
+  if (STATE.pendingTrainInferenceName) {
+    const m = STATE.inferenceModels.find(
+      (x) => x.name === STATE.pendingTrainInferenceName,
+    );
+    STATE.pendingTrainInferenceName = null;
+    if (m) startTraining(m.id);
+  }
+
+  renderInferenceList();
+  renderInferenceModelChoices();
+
+  // Refresh the open editor (e.g. status/metrics updated after training).
+  if (STATE.editingInferenceId && STATE.editingInferenceId !== "__new__") {
+    const m = STATE.inferenceModels.find((x) => x.id === STATE.editingInferenceId);
+    if (m) refreshInferenceEditor(m);
+  }
+}
+
+function renderInferenceList() {
+  const list = DOM.inferenceList;
+  if (!list) return;
+  list.innerHTML = "";
+  if (DOM.inferenceCount) {
+    DOM.inferenceCount.textContent = String(STATE.inferenceModels.length);
+  }
+
+  if (STATE.inferenceModels.length === 0) {
+    list.innerHTML =
+      '<div class="placeholder">No models yet. Create one to get started.</div>';
+    return;
+  }
+
+  STATE.inferenceModels.forEach((m) => {
+    const div = document.createElement("div");
+    div.className = "processor-entry";
+    if (m.id === STATE.editingInferenceId) div.classList.add("active");
+
+    const name = document.createElement("span");
+    name.className = "p-name";
+    name.textContent = m.name || "(unnamed)";
+    name.title = m.name || "";
+
+    const badge = document.createElement("span");
+    badge.className = `status-badge ${m.status || "untrained"}`;
+    badge.textContent = m.status || "untrained";
+
+    div.appendChild(name);
+    div.appendChild(badge);
+    div.addEventListener("click", () => editInferenceModel(m.id));
+    list.appendChild(div);
+  });
+}
+
+function openInferenceEditor() {
+  DOM.inferenceEditorPlaceholder.classList.add("hidden");
+  DOM.inferenceEditorPanel.classList.remove("hidden");
+  DOM.inferenceDirBrowser.classList.add("hidden");
+}
+
+function closeInferenceEditor() {
+  STATE.editingInferenceId = null;
+  DOM.inferenceEditorPanel.classList.add("hidden");
+  DOM.inferenceEditorPlaceholder.classList.remove("hidden");
+  setInferenceMessage("");
+  renderInferenceList();
+}
+
+function newInferenceModel() {
+  STATE.editingInferenceId = "__new__";
+  openInferenceEditor();
+  DOM.inferenceName.value = "";
+  DOM.inferencePosDir.value = "";
+  DOM.inferenceNegDir.value = "";
+  DOM.btnDeleteInference.classList.add("hidden");
+  setInferenceStatusBadge("untrained");
+  renderInferenceMetrics(null);
+  setInferenceMessage("Pick positive and negative folders, then Save.");
+  renderInferenceList();
+  DOM.inferenceName.focus();
+}
+
+function editInferenceModel(id) {
+  const m = STATE.inferenceModels.find((x) => x.id === id);
+  if (!m) return;
+  STATE.editingInferenceId = id;
+  openInferenceEditor();
+  DOM.inferenceName.value = m.name || "";
+  DOM.inferencePosDir.value = m.positiveDir || "";
+  DOM.inferenceNegDir.value = m.negativeDir || "";
+  DOM.btnDeleteInference.classList.remove("hidden");
+  setInferenceMessage("");
+  refreshInferenceEditor(m);
+  renderInferenceList();
+}
+
+// Update only the live status/metrics of the currently-open editor without
+// clobbering text fields the user may be editing.
+function refreshInferenceEditor(m) {
+  setInferenceStatusBadge(m.status || "untrained", m.error);
+  renderInferenceMetrics(m.metrics || null);
+  const training = STATE.trainingInferenceId === m.id || m.status === "training";
+  DOM.btnTrainInference.disabled = training;
+  DOM.btnTrainInference.textContent = training ? "Training…" : "Train";
+}
+
+function setInferenceStatusBadge(status, error) {
+  if (!DOM.inferenceStatusBadge) return;
+  DOM.inferenceStatusBadge.className = `status-badge ${status}`;
+  DOM.inferenceStatusBadge.textContent = status;
+  DOM.inferenceStatusBadge.title = error || "";
+}
+
+function renderInferenceMetrics(metrics) {
+  const el = DOM.inferenceMetrics;
+  if (!el) return;
+  if (!metrics) {
+    el.innerHTML = "";
+    return;
+  }
+  const top = (metrics.topFeatures || [])
+    .map((f) => `<li><code>${escapeHtml(f.name)}</code> — ${f.importance.toFixed(3)}</li>`)
+    .join("");
+  el.innerHTML =
+    `<div class="metrics-grid">` +
+    `<div><span class="metrics-label">Positive samples</span><span>${metrics.nPos}</span></div>` +
+    `<div><span class="metrics-label">Negative samples</span><span>${metrics.nNeg}</span></div>` +
+    `<div><span class="metrics-label">Train accuracy</span><span>${(metrics.trainAcc * 100).toFixed(1)}%</span></div>` +
+    `<div><span class="metrics-label">Test accuracy</span><span>${(metrics.testAcc * 100).toFixed(1)}%</span></div>` +
+    `<div><span class="metrics-label">Features</span><span>${metrics.features}</span></div>` +
+    `</div>` +
+    (top ? `<div class="metrics-top"><span class="metrics-label">Top features</span><ul>${top}</ul></div>` : "");
+}
+
+function setInferenceMessage(text, kind) {
+  if (!DOM.inferenceEditorMessage) return;
+  DOM.inferenceEditorMessage.textContent = text || "";
+  DOM.inferenceEditorMessage.className =
+    "editor-message" + (kind ? " " + kind : "");
+}
+
+// Read the editor fields and send a save. Returns false on validation failure.
+// When `silent` is true, success messages are suppressed (used before Train).
+function saveInferenceModel(silent) {
+  const name = DOM.inferenceName.value.trim();
+  const positiveDir = DOM.inferencePosDir.value.trim();
+  const negativeDir = DOM.inferenceNegDir.value.trim();
+
+  if (!name) {
+    setInferenceMessage("Please give the model a name.", "error");
+    return false;
+  }
+  if (!positiveDir || !negativeDir) {
+    setInferenceMessage("Please set both the positive and negative folders.", "error");
+    return false;
+  }
+
+  const id = STATE.editingInferenceId === "__new__"
+    ? undefined
+    : STATE.editingInferenceId;
+
+  const sent = sendMessage({
+    type: "save_inference_model",
+    model: { id, name, positiveDir, negativeDir },
+  });
+  if (!sent) {
+    setInferenceMessage("Not connected — could not save.", "error");
+    return false;
+  }
+
+  if (!id) STATE.pendingSelectInferenceName = name;
+  if (!silent) setInferenceMessage("Saved.", "success");
+  return true;
+}
+
+function deleteInferenceModel() {
+  if (!STATE.editingInferenceId || STATE.editingInferenceId === "__new__") {
+    closeInferenceEditor();
+    return;
+  }
+  const m = STATE.inferenceModels.find((x) => x.id === STATE.editingInferenceId);
+  if (m && !confirm(`Delete model "${m.name}"?`)) return;
+  sendMessage({ type: "delete_inference_model", id: STATE.editingInferenceId });
+  closeInferenceEditor();
+}
+
+// Persist the current edits, then train. Training starts once the saved model
+// (with a concrete id) comes back in the models list.
+function trainInferenceModel() {
+  const name = DOM.inferenceName.value.trim();
+  if (!saveInferenceModel(true)) return;
+
+  if (STATE.editingInferenceId && STATE.editingInferenceId !== "__new__") {
+    startTraining(STATE.editingInferenceId);
+  } else {
+    // New model: defer until the save round-trip assigns an id.
+    STATE.pendingTrainInferenceName = name;
+  }
+  setInferenceMessage("Training… progress streams to the Live Log tab.");
+}
+
+function startTraining(id) {
+  STATE.trainingInferenceId = id;
+  if (DOM.btnTrainInference) {
+    DOM.btnTrainInference.disabled = true;
+    DOM.btnTrainInference.textContent = "Training…";
+  }
+  setInferenceStatusBadge("training");
+  sendMessage({ type: "train_inference_model", id });
+}
+
+function handleInferenceModelTrained(msg) {
+  if (STATE.trainingInferenceId === msg.id) STATE.trainingInferenceId = null;
+  if (DOM.btnTrainInference) {
+    DOM.btnTrainInference.disabled = false;
+    DOM.btnTrainInference.textContent = "Train";
+  }
+  if (msg.error) {
+    if (STATE.editingInferenceId === msg.id) {
+      setInferenceStatusBadge("error", msg.error);
+      setInferenceMessage(`Training failed: ${msg.error}`, "error");
+    }
+  } else if (STATE.editingInferenceId === msg.id) {
+    setInferenceMessage("Training complete.", "success");
+  }
+  // The updated models list (status/metrics) arrives separately via
+  // inference_models_list and refreshes the editor + preview choices.
+}
+
+// ---- Shared inline folder browser (positive/negative pickers) --------------
+
+function openDirBrowser(targetInputId) {
+  STATE.dirBrowseTarget = targetInputId;
+  DOM.inferenceDirBrowser.classList.remove("hidden");
+  const current = (document.getElementById(targetInputId).value || "").trim();
+  navigateInferenceBrowserTo(current || "/");
+}
+
+function navigateInferenceBrowserTo(path) {
+  STATE.dirBrowsePath = path;
+  if (DOM.inferenceBrowsePath) DOM.inferenceBrowsePath.value = path;
+  if (DOM.inferenceBrowserList) {
+    DOM.inferenceBrowserList.innerHTML =
+      '<div class="browser-placeholder">Loading...</div>';
+  }
+  if (!sendMessage({ type: "browse_folder", path, page: "inference" })) {
+    if (DOM.inferenceBrowserList) {
+      DOM.inferenceBrowserList.innerHTML =
+        '<div class="browser-placeholder">WebSocket not connected. Please wait...</div>';
+    }
+  }
+}
+
+function handleInferenceBrowseResult(data) {
+  const list = DOM.inferenceBrowserList;
+  if (!list) return;
+  if (data.error) {
+    list.innerHTML =
+      `<div class="browser-placeholder">Error: ${escapeHtml(data.error)}</div>`;
+    return;
+  }
+  STATE.dirBrowsePath = data.path;
+  if (DOM.inferenceBrowsePath) DOM.inferenceBrowsePath.value = data.path;
+
+  list.innerHTML = "";
+  const dirs = (data.entries || []).filter((e) => e.isDirectory);
+  dirs.forEach((entry) => {
+    const div = document.createElement("div");
+    div.className = "browser-entry";
+    const icon = document.createElement("span");
+    icon.className = "entry-icon";
+    icon.textContent = "📁";
+    const name = document.createElement("span");
+    name.className = "entry-name";
+    name.textContent = entry.name;
+    div.appendChild(icon);
+    div.appendChild(name);
+    const targetPath = data.path === "/"
+      ? `/${entry.name}`
+      : `${data.path}/${entry.name}`;
+    div.addEventListener("click", () => navigateInferenceBrowserTo(targetPath));
+    list.appendChild(div);
+  });
+  if (dirs.length === 0) {
+    list.innerHTML =
+      '<div class="browser-placeholder">No sub-folders here. Use this folder, or go up.</div>';
+  }
+}
+
+function useDirBrowser() {
+  if (STATE.dirBrowseTarget) {
+    const input = document.getElementById(STATE.dirBrowseTarget);
+    if (input) input.value = STATE.dirBrowsePath;
+  }
+  DOM.inferenceDirBrowser.classList.add("hidden");
+  STATE.dirBrowseTarget = null;
+}
+
+// ============================================================================
+// Preview: inference-model filter column
+// ============================================================================
+
+function renderInferenceModelChoices() {
+  const el = DOM.inferenceModelChoices;
+  if (!el) return;
+  const trained = STATE.inferenceModels.filter((m) => m.status === "trained");
+
+  if (DOM.inferenceFilterCount) {
+    DOM.inferenceFilterCount.textContent = String(trained.length);
+  }
+
+  el.innerHTML = "";
+  if (trained.length === 0) {
+    el.innerHTML =
+      '<div class="placeholder">No trained models yet. Train one on the Inference Models tab.</div>';
+    if (DOM.btnApplyInference) DOM.btnApplyInference.disabled = true;
+    return;
+  }
+
+  trained.forEach((m) => {
+    const label = document.createElement("label");
+    label.className = "inference-choice";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "inference-model";
+    radio.value = m.id;
+    if (STATE.appliedInferenceId === m.id) radio.checked = true;
+    radio.addEventListener("change", () => {
+      if (DOM.btnApplyInference) DOM.btnApplyInference.disabled = false;
+    });
+    const span = document.createElement("span");
+    span.textContent = m.name;
+    span.title = m.name;
+    label.appendChild(radio);
+    label.appendChild(span);
+    el.appendChild(label);
+  });
+
+  // Enable Apply if something is selected (or pre-selected from a prior apply).
+  const anyChecked = !!el.querySelector('input[name="inference-model"]:checked');
+  if (DOM.btnApplyInference) DOM.btnApplyInference.disabled = !anyChecked;
+}
+
+function selectedInferenceModelId() {
+  const el = DOM.inferenceModelChoices;
+  const checked = el && el.querySelector('input[name="inference-model"]:checked');
+  return checked ? checked.value : null;
+}
+
+function applyInferenceModel() {
+  if (STATE.applyingInference) return;
+  const id = selectedInferenceModelId();
+  if (!id) {
+    setInferenceFilterStatus("Select a trained model first.", true);
+    return;
+  }
+  if (STATE.results.length === 0) {
+    setInferenceFilterStatus("No images loaded — run a scan first.", true);
+    return;
+  }
+
+  STATE.applyingInference = true;
+  if (DOM.btnApplyInference) {
+    DOM.btnApplyInference.disabled = true;
+    DOM.btnApplyInference.textContent = "Applying…";
+  }
+  setInferenceFilterStatus("Running inference…");
+
+  const sent = sendMessage({
+    type: "apply_inference_model",
+    id,
+    threshold: STATE.inferenceThreshold,
+  });
+  if (!sent) {
+    STATE.applyingInference = false;
+    if (DOM.btnApplyInference) {
+      DOM.btnApplyInference.disabled = false;
+      DOM.btnApplyInference.textContent = "Apply";
+    }
+    setInferenceFilterStatus("Not connected — could not run.", true);
+  }
+}
+
+function handleInferenceModelApplied(msg) {
+  STATE.applyingInference = false;
+  if (DOM.btnApplyInference) {
+    DOM.btnApplyInference.disabled = false;
+    DOM.btnApplyInference.textContent = "Apply";
+  }
+  if (msg.error) {
+    setInferenceFilterStatus(`Inference failed: ${msg.error}`, true);
+    return;
+  }
+
+  const model = STATE.inferenceModels.find((m) => m.id === msg.id);
+  const modelName = model ? model.name : "model";
+  const results = msg.results || {};
+
+  const filtered = {};
+  let passed = 0;
+  let scored = 0;
+  for (const r of STATE.results) {
+    const res = results[r.result];
+    if (!res) continue; // failed/unscored images aren't touched by the filter
+    scored++;
+    if (res.pass) {
+      passed++;
+    } else {
+      filtered[r.result] = `Below threshold ${msg.threshold.toFixed(2)} ` +
+        `(model "${modelName}", score ${(res.prob ?? 0).toFixed(2)})`;
+    }
+  }
+
+  STATE.inferenceFilteredOut = filtered;
+  STATE.appliedInferenceId = msg.id;
+  if (DOM.btnClearInference) DOM.btnClearInference.classList.remove("hidden");
+
+  renderImageList();
+  const hidden = Object.keys(filtered).length;
+  setInferenceFilterStatus(
+    `"${modelName}": ${passed} passed, ${hidden} filtered of ${scored} scored.`,
+    hidden > 0,
+  );
+}
+
+function clearInferenceFilter() {
+  STATE.inferenceFilteredOut = {};
+  STATE.appliedInferenceId = null;
+  if (DOM.btnClearInference) DOM.btnClearInference.classList.add("hidden");
+  setInferenceFilterStatus("");
+  renderImageList();
+}
+
+function setInferenceFilterStatus(text, highlight) {
+  const el = DOM.inferenceFilterStatus;
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("has-filter", !!highlight);
+}
+
+// ============================================================================
 // Init
 // ============================================================================
 
@@ -2121,6 +2907,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initLogPage();
   initPreviewPage();
   initProcessorsPage();
+  initInferencePage();
   initFileBrowser();
 
   // Navigation

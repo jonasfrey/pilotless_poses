@@ -15,6 +15,7 @@
       <button id="nav-log" class="nav-tab" data-page="log">Live Log</button>
       <button id="nav-preview" class="nav-tab" data-page="preview">Pose Preview</button>
       <button id="nav-processors" class="nav-tab" data-page="processors">Processors</button>
+      <button id="nav-inference" class="nav-tab" data-page="inference">Inference Models</button>
     </nav>
     <div class="connection-indicator" id="connection-indicator" title="WebSocket status">
       <span class="dot"></span>
@@ -116,14 +117,39 @@
             <button id="btn-run-processors" class="btn btn-primary btn-sm" title="Run all images against active processors">
               Run Processors
             </button>
-            <label class="show-filtered-control" title="Show images filtered out by processors">
+            <label class="show-filtered-control" title="Show images filtered out by processors or inference models">
               <input type="checkbox" id="chk-show-filtered"> Show filtered
+            </label>
+            <label class="show-filtered-control" title="Show images whose pose inference failed">
+              <input type="checkbox" id="chk-show-failed"> Show failed
             </label>
           </div>
           <div id="processor-filter-status" class="processor-filter-status"></div>
           <div id="image-list" class="image-list">
             <div class="placeholder">No images loaded. Run a scan first, then switch to this tab.</div>
           </div>
+        </aside>
+
+        <!-- Inference model filter -->
+        <aside class="inference-filter-sidebar" id="inference-filter-sidebar">
+          <div class="sidebar-header">
+            <h3>Inference Models</h3>
+            <span id="inference-filter-count" class="badge">0</span>
+          </div>
+          <p class="hint pipeline-hint">Filter images with a trained model. Passes if any person scores above the threshold.</p>
+          <div id="inference-model-choices" class="inference-model-choices">
+            <div class="placeholder">No trained models yet.</div>
+          </div>
+          <div class="inference-threshold-row">
+            <label for="inference-threshold">Threshold</label>
+            <input type="range" id="inference-threshold" min="0" max="1" step="0.01" value="0.5">
+            <span id="inference-threshold-value" class="nav-index">0.50</span>
+          </div>
+          <div class="sidebar-controls">
+            <button id="btn-apply-inference" class="btn btn-primary btn-sm" disabled>Apply</button>
+            <button id="btn-clear-inference" class="btn btn-secondary btn-sm hidden">Clear</button>
+          </div>
+          <div id="inference-filter-status" class="processor-filter-status"></div>
         </aside>
 
         <!-- Active processor pipeline (drag to reorder) -->
@@ -153,6 +179,12 @@
               </button>
               <button id="btn-toggle-info" class="btn btn-sm" title="Toggle image data overlay (I)">
                 Show Info
+              </button>
+              <button id="btn-toggle-keypoints" class="btn btn-sm" title="Toggle per-keypoint pixel coordinates (K)">
+                Show Keypoints
+              </button>
+              <button id="btn-reset-view" class="btn btn-sm" title="Reset zoom &amp; pan (0)">
+                Reset View
               </button>
               <label class="opacity-control" title="Overlay opacity">
                 Opacity
@@ -262,6 +294,94 @@
                 <li><code>f_deno_write_file(path, data)</code> — low-level <code>Deno.writeFile</code> proxy; <code>data</code> may be a string, <code>Uint8Array</code>, <code>ArrayBuffer</code>, or <code>number[]</code></li>
               </ul>
             </details>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- Page 5: Inference Models                                            -->
+  <!-- ================================================================== -->
+  <main id="page-inference" class="page">
+    <section class="card" id="inference-main">
+      <h2>Inference Models</h2>
+      <div class="processors-layout">
+        <!-- Model list sidebar -->
+        <aside class="processor-sidebar">
+          <div class="sidebar-header">
+            <h3>Saved Models</h3>
+            <span id="inference-count" class="badge">0</span>
+          </div>
+          <button id="btn-new-inference" class="btn btn-primary btn-sm">+ New Model</button>
+          <div id="inference-list" class="processor-list">
+            <div class="placeholder">No models yet. Create one to get started.</div>
+          </div>
+        </aside>
+
+        <!-- Editor panel -->
+        <div class="processor-editor-area" id="inference-editor-area">
+          <div class="editor-placeholder" id="inference-editor-placeholder">
+            Select a model to edit, or create a new one.
+          </div>
+          <div class="editor-panel hidden" id="inference-editor-panel">
+            <div class="form-group">
+              <label for="inference-name">Name</label>
+              <input type="text" id="inference-name" placeholder="e.g. Hands in the air"
+                     autocomplete="off" spellcheck="false">
+            </div>
+
+            <p class="hint editor-hint">
+              Point each field at a folder of <code>&lt;name&gt;_pose.json</code> files. Images in the
+              <strong>positive</strong> folder are examples of the pose you want; images in the
+              <strong>negative</strong> folder are counter-examples. Training learns to tell them apart.
+            </p>
+
+            <div class="form-group">
+              <label for="inference-pos-dir">Positive examples folder</label>
+              <div class="input-row">
+                <input type="text" id="inference-pos-dir" placeholder="e.g. ./filtered_images"
+                       autocomplete="off" spellcheck="false">
+                <button class="btn btn-icon btn-browse-dir" data-target="inference-pos-dir" title="Browse">📁</button>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="inference-neg-dir">Negative examples folder</label>
+              <div class="input-row">
+                <input type="text" id="inference-neg-dir" placeholder="e.g. ./negative_examples"
+                       autocomplete="off" spellcheck="false">
+                <button class="btn btn-icon btn-browse-dir" data-target="inference-neg-dir" title="Browse">📁</button>
+              </div>
+            </div>
+
+            <!-- Shared inline folder browser (toggled by the 📁 buttons) -->
+            <div class="dir-browser hidden" id="inference-dir-browser">
+              <div class="input-row">
+                <input type="text" id="inference-browse-path" value="/" autocomplete="off" spellcheck="false">
+                <button id="btn-inference-browse-up" class="btn btn-icon" title="Go up one directory">←</button>
+                <button id="btn-inference-browse-use" class="btn btn-primary btn-sm">Use this folder</button>
+              </div>
+              <div class="browser-list" id="inference-browser-list">
+                <div class="browser-placeholder">Loading...</div>
+              </div>
+            </div>
+
+            <div class="inference-status-row">
+              <span id="inference-status-badge" class="status-badge">untrained</span>
+              <button id="btn-train-inference" class="btn btn-primary btn-sm">Train</button>
+            </div>
+
+            <div id="inference-metrics" class="inference-metrics"></div>
+            <div id="inference-editor-message" class="editor-message"></div>
+
+            <div class="actions">
+              <button id="btn-save-inference" class="btn btn-primary">Save</button>
+              <button id="btn-delete-inference" class="btn btn-danger hidden">Delete</button>
+              <button id="btn-cancel-inference" class="btn btn-secondary">Cancel</button>
+            </div>
+
+            <p class="hint">Training progress streams to the <strong>Live Log</strong> tab.</p>
           </div>
         </div>
       </div>
