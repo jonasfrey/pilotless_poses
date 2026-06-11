@@ -848,6 +848,22 @@ function isFailed(result) {
   return result.status !== "ok";
 }
 
+// The images currently shown in the sidebar, in order. Navigation (arrow keys
+// and the prev/next buttons) walks THIS list, not STATE.results — so once
+// processors filter images out, the arrows only step through what's visible.
+//
+// Visibility rules:
+//  - Failed images (inference errored) are hidden unless "Show failed" is on.
+//  - Processor- / inference-filtered images are hidden unless "Show filtered"
+//    is on (then they remain but are dimmed).
+function visibleResults() {
+  return STATE.results.filter((r) => {
+    if (isFailed(r) && !STATE.showFailed) return false;
+    if (isFilteredOut(r) && !STATE.showFiltered) return false;
+    return true;
+  });
+}
+
 function renderImageList() {
   if (!DOM.imageList) return;
 
@@ -861,15 +877,7 @@ function renderImageList() {
     return;
   }
 
-  // Visibility rules:
-  //  - Failed images (inference errored) are hidden unless "Show failed" is on.
-  //  - Processor- / inference-filtered images are hidden unless "Show filtered"
-  //    is on (then they remain but are dimmed).
-  const visible = STATE.results.filter((r) => {
-    if (isFailed(r) && !STATE.showFailed) return false;
-    if (isFilteredOut(r) && !STATE.showFiltered) return false;
-    return true;
-  });
+  const visible = visibleResults();
 
   console.log(
     `[renderImageList] ${STATE.results.length} total, ${
@@ -991,9 +999,14 @@ function selectImage(index) {
   const item = document.querySelector(`.image-item[data-index="${index}"]`);
   if (item) item.classList.add("active");
 
-  // Update nav display
+  // Update nav display — show position within the visible (shown) images, not
+  // the full result set, so it matches what the arrows actually step through.
   if (DOM.navIndex) {
-    DOM.navIndex.textContent = `${index + 1} / ${STATE.results.length}`;
+    const visible = visibleResults();
+    const vpos = visible.indexOf(STATE.results[index]);
+    DOM.navIndex.textContent = vpos >= 0
+      ? `${vpos + 1} / ${visible.length}`
+      : `– / ${visible.length}`;
   }
 
   // Show canvas area
@@ -1395,11 +1408,21 @@ function toggleLabels() {
 }
 
 function navigateImages(delta) {
-  if (STATE.results.length === 0) return;
-  let idx = STATE.currentResultIndex + delta;
-  if (idx < 0) idx = STATE.results.length - 1;
-  if (idx >= STATE.results.length) idx = 0;
-  selectImage(idx);
+  const visible = visibleResults();
+  if (visible.length === 0) return;
+
+  // Step relative to the current image's position WITHIN the visible list. If
+  // the current image isn't visible (or none is selected), start from an end so
+  // the first press lands on a shown image.
+  const current = STATE.results[STATE.currentResultIndex];
+  let pos = current ? visible.indexOf(current) : -1;
+  if (pos === -1) pos = delta >= 0 ? -1 : 0;
+
+  let nextPos = pos + delta;
+  if (nextPos < 0) nextPos = visible.length - 1;
+  if (nextPos >= visible.length) nextPos = 0;
+
+  selectImage(STATE.results.indexOf(visible[nextPos]));
 }
 
 function handleKeyboard(e) {
@@ -2077,13 +2100,22 @@ async function handleAllPoseData(msg) {
   const procErrors = new Map();
 
   // Resolve image dimensions with limited concurrency so we don't open
-  // hundreds of image requests at once.
+  // hundreds of image requests at once. This is the slow part of a run, so
+  // report progress (e.g. "22 / 200 images") as each image resolves.
+  let processed = 0;
+  updateFilterStatusText(`Running processors… 0 / ${items.length} images`);
   const dimsByResult = await mapWithConcurrency(items, 6, async (item) => {
-    if (item.status !== "ok") return [item.result, { width: 0, height: 0 }];
-    const dims = await loadImageDims(item.source).catch(() => ({
-      width: 0,
-      height: 0,
-    }));
+    let dims = { width: 0, height: 0 };
+    if (item.status === "ok") {
+      dims = await loadImageDims(item.source).catch(() => ({
+        width: 0,
+        height: 0,
+      }));
+    }
+    processed++;
+    updateFilterStatusText(
+      `Running processors… ${processed} / ${items.length} images`,
+    );
     return [item.result, dims];
   });
   const dimMap = Object.fromEntries(dimsByResult);
