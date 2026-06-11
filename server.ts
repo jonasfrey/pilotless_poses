@@ -7,6 +7,11 @@
 
 import { ensureDependencies } from "./setup.ts";
 
+// All scan results and the manifest always live here, relative to the server's
+// working directory. This is intentionally not configurable — the pose preview
+// reads from this single, well-known location.
+const OUTPUT_DIR = "./pose_results/";
+
 // ---- Types ------------------------------------------------------------------
 
 interface AppConfig {
@@ -21,12 +26,10 @@ interface ScanFolderMessage {
   type: "scan_folder";
   folderPath: string;
   extensions: string[];
-  outputDir: string;
 }
 
 interface GetResultsMessage {
   type: "get_results";
-  folderPath: string;
 }
 
 interface GetPoseDataMessage {
@@ -81,7 +84,6 @@ interface ReorderProcessorsMessage {
 
 interface GetAllPoseDataMessage {
   type: "get_all_pose_data";
-  folderPath: string;
 }
 
 interface WriteFileMessage {
@@ -604,7 +606,7 @@ async function handleScanFolder(
   config: AppConfig,
   connManager: ConnectionManager,
 ): Promise<void> {
-  const { folderPath, extensions, outputDir: outputDirRaw } = msg;
+  const { folderPath, extensions } = msg;
 
   // Stream a line to the client's Live Log page.
   const log = (line: string, level: "info" | "python" | "error" = "info") => {
@@ -628,7 +630,7 @@ async function handleScanFolder(
     return;
   }
 
-  const outputDir = outputDirRaw || "./pose_results/";
+  const outputDir = OUTPUT_DIR;
 
   // Cancel any existing scan for this connection
   const existingState = connManager.getScanState(ws);
@@ -663,8 +665,10 @@ async function handleScanFolder(
     manifest.source_folder = folderPath;
     manifest.output_dir = outputDir;
 
-    // Remove stale entries for images being reprocessed
-    const imageSet = new Set(images.map((img) => img.split("/").pop()!));
+    // Remove stale entries for images being reprocessed. entry.source stores
+    // the full image path, so compare against the full paths (not basenames),
+    // otherwise old entries are never dropped and duplicates accumulate.
+    const imageSet = new Set(images);
     manifest.results = manifest.results.filter((entry) =>
       !imageSet.has(entry.source)
     );
@@ -837,54 +841,37 @@ async function handleScanFolder(
 
 async function handleGetResults(
   ws: WebSocket,
-  msg: GetResultsMessage,
+  _msg: GetResultsMessage,
   connManager: ConnectionManager,
 ): Promise<void> {
-  const { folderPath } = msg;
+  // The pose preview always shows ALL scanned results from the single
+  // manifest in OUTPUT_DIR — it is not scoped to any selected folder.
+  const manifestPath = `${OUTPUT_DIR}/manifest.json`;
+  console.log(`[get_results] reading ${manifestPath} (cwd: ${Deno.cwd()})`);
 
-  // The manifest is stored in the output directory
-  // We need to find the manifest that matches this source folder
-  // Strategy: look in ./pose_results/ for manifest.json, or scan the
-  // source folder's sibling results directory
-
-  // First, check the default output dir
-  const defaultOutputDir = "./pose_results/";
-  let manifest: Manifest | null = null;
-
-  if (await pathExists(`${defaultOutputDir}/manifest.json`)) {
-    const m = await loadManifest(defaultOutputDir);
-    // Check if this manifest matches or is relevant
-    if (
-      m.source_folder === folderPath ||
-      m.source_folder === "" ||
-      m.results.length > 0
-    ) {
-      manifest = m;
-    }
-  }
-
-  // Also check if there's an output dir mirroring the source structure
-  // (output_dir based on source folder name)
-  const sourceName = folderPath.replace(/\/+$/, "").split("/").pop() || "results";
-  const namedOutputDir = `./pose_results/${sourceName}`;
-  if (
-    !manifest &&
-    await pathExists(`${namedOutputDir}/manifest.json`)
-  ) {
-    manifest = await loadManifest(namedOutputDir);
-  }
-
-  if (!manifest || manifest.results.length === 0) {
-    connManager.send(ws, {
-      type: "results_list",
-      results: [],
-    });
+  if (!(await pathExists(manifestPath))) {
+    console.warn(`[get_results] no manifest at ${manifestPath} — returning 0 results`);
+    connManager.send(ws, { type: "results_list", results: [] });
     return;
   }
 
+  const manifest = await loadManifest(OUTPUT_DIR);
+
+  // Dedupe by source, keeping the most recent entry. Older manifests written
+  // before the dedup fix can contain repeated entries for the same image.
+  const bySource = new Map<string, typeof manifest.results[number]>();
+  for (const entry of manifest.results) bySource.set(entry.source, entry);
+  const results = [...bySource.values()];
+
+  console.log(
+    `[get_results] returning ${results.length} result(s) to client` +
+      (results.length !== manifest.results.length
+        ? ` (deduped from ${manifest.results.length})`
+        : ""),
+  );
   connManager.send(ws, {
     type: "results_list",
-    results: manifest.results,
+    results,
   });
 }
 
@@ -1342,37 +1329,18 @@ async function handleWriteFile(
 
 async function handleGetAllPoseData(
   ws: WebSocket,
-  msg: GetAllPoseDataMessage,
+  _msg: GetAllPoseDataMessage,
   connManager: ConnectionManager,
 ): Promise<void> {
-  const { folderPath } = msg;
-
-  // Mirror the lookup strategy used by handleGetResults so we operate on the
-  // same manifest the preview page already loaded.
-  const defaultOutputDir = "./pose_results/";
-  let manifest: Manifest | null = null;
-
-  if (await pathExists(`${defaultOutputDir}/manifest.json`)) {
-    const m = await loadManifest(defaultOutputDir);
-    if (
-      m.source_folder === folderPath ||
-      m.source_folder === "" ||
-      m.results.length > 0
-    ) {
-      manifest = m;
-    }
+  // Operate on the same single manifest the preview page loads.
+  if (!(await pathExists(`${OUTPUT_DIR}/manifest.json`))) {
+    connManager.send(ws, { type: "all_pose_data", items: [] });
+    return;
   }
 
-  if (!manifest) {
-    const sourceName = folderPath.replace(/\/+$/, "").split("/").pop() ||
-      "results";
-    const namedOutputDir = `./pose_results/${sourceName}`;
-    if (await pathExists(`${namedOutputDir}/manifest.json`)) {
-      manifest = await loadManifest(namedOutputDir);
-    }
-  }
+  const manifest = await loadManifest(OUTPUT_DIR);
 
-  if (!manifest || manifest.results.length === 0) {
+  if (manifest.results.length === 0) {
     connManager.send(ws, { type: "all_pose_data", items: [] });
     return;
   }
@@ -1416,6 +1384,10 @@ async function serveImage(url: URL): Promise<Response> {
 
   try {
     if (!(await isFile(path))) {
+      console.warn(
+        `[serveImage] 404 — file not found: ${path} ` +
+          `(if this is an absolute path from a manifest created on another machine, it won't exist here)`,
+      );
       return new Response("File not found", { status: 404 });
     }
 

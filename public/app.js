@@ -367,6 +367,27 @@ function handleBatchComplete(msg) {
 
 function handleResultsList(msg) {
   STATE.results = msg.results || [];
+  console.log(
+    "[handleResultsList] received",
+    STATE.results.length,
+    "result(s) from server.",
+  );
+  if (STATE.results.length === 0) {
+    console.warn(
+      "[handleResultsList] Server returned 0 results. Either the manifest is empty/missing " +
+        "or its source_folder didn't match the requested folder. Check pose_results/manifest.json on this machine.",
+    );
+  } else {
+    const byStatus = STATE.results.reduce((acc, r) => {
+      acc[r.status] = (acc[r.status] || 0) + 1;
+      return acc;
+    }, {});
+    console.log("[handleResultsList] status breakdown:", byStatus);
+    console.log(
+      "[handleResultsList] first result:",
+      JSON.stringify(STATE.results[0]),
+    );
+  }
   renderImageList();
 }
 
@@ -494,7 +515,6 @@ function navigateTo(page) {
 function initScanPage() {
   DOM.folderPath = document.getElementById("folder-path");
   DOM.extFilter = document.getElementById("ext-filter");
-  DOM.outputDir = document.getElementById("output-dir");
   DOM.btnStartScan = document.getElementById("btn-start-scan");
   DOM.btnCancelScan = document.getElementById("btn-cancel-scan");
   DOM.progressBar = document.getElementById("progress-bar");
@@ -526,7 +546,6 @@ function startScan() {
 
   const extRaw = DOM.extFilter.value.trim() || ".jpg,.jpeg,.png";
   const extensions = extRaw.split(",").map((s) => s.trim()).filter(Boolean);
-  const outputDir = DOM.outputDir.value.trim() || "./pose_results/";
 
   STATE.scanning = true;
   STATE.errors = [];
@@ -546,7 +565,6 @@ function startScan() {
     type: "scan_folder",
     folderPath,
     extensions,
-    outputDir,
   });
 
   if (!sent) {
@@ -708,16 +726,17 @@ function initPreviewPage() {
 }
 
 function loadResults() {
-  // Use the folder that was last scanned (from the file browser)
-  const folderPath = FILE_BROWSER.scanPath;
-  if (!folderPath || folderPath === "/") {
-    // Nothing scanned yet — show empty state
-    STATE.results = [];
-    renderImageList();
-    return;
+  // The pose preview always shows ALL scanned results from the server's
+  // ./pose_results manifest — it does not depend on the folder currently
+  // selected on the Folder Scan page.
+  console.log("[loadResults] requesting all scanned pose results");
+  const sent = sendMessage({ type: "get_results" });
+  if (!sent) {
+    console.warn(
+      "[loadResults] WebSocket not connected — get_results was NOT sent. ws.readyState =",
+      STATE.ws ? STATE.ws.readyState : "no ws",
+    );
   }
-
-  sendMessage({ type: "get_results", folderPath });
 }
 
 function isFilteredOut(result) {
@@ -741,6 +760,12 @@ function renderImageList() {
   // dropped from the list entirely; when on, they remain but are dimmed.
   const visible = STATE.results.filter(
     (r) => STATE.showFiltered || !isFilteredOut(r),
+  );
+
+  console.log(
+    `[renderImageList] ${STATE.results.length} total, ${
+      Object.keys(STATE.filteredOut).length
+    } filtered out by processors, ${visible.length} visible (showFiltered=${STATE.showFiltered}).`,
   );
 
   DOM.imageCount.textContent = String(visible.length);
@@ -767,7 +792,14 @@ function renderImageList() {
     thumb.src = `/api/thumbnail?path=${encodeURIComponent(r.source)}`;
     thumb.alt = r.source;
     thumb.loading = "lazy";
-    thumb.onerror = () => { thumb.src = ""; };
+    thumb.onerror = () => {
+      console.warn(
+        "[thumbnail] failed to load source image:", r.source,
+        "\n  → The server could not serve this path. On a different machine the manifest's",
+        "absolute source paths often don't exist (different home dir / checkout location).",
+      );
+      thumb.src = "";
+    };
 
     const info = document.createElement("div");
     info.className = "info";
@@ -865,10 +897,15 @@ function selectImage(index) {
     });
   };
   img.onerror = () => {
+    console.warn(
+      "[selectImage] failed to load source image:", result.source,
+      "— the server returned an error for /api/image. The path likely does not exist on this machine.",
+    );
     STATE.currentImage = null;
     STATE.currentPoseData = null;
     clearCanvasWithMessage("Failed to load image.");
   };
+  console.log("[selectImage] loading image", result.source, "pose result:", result.result);
   img.src = `/api/image?path=${encodeURIComponent(result.source)}`;
 }
 
@@ -1575,8 +1612,7 @@ async function runProcessors() {
   setRunButton(true);
   updateFilterStatusText("Loading pose data…");
 
-  const folderPath = FILE_BROWSER.scanPath;
-  const sent = sendMessage({ type: "get_all_pose_data", folderPath });
+  const sent = sendMessage({ type: "get_all_pose_data" });
   if (!sent) {
     STATE.runningProcessors = false;
     setRunButton(false);
@@ -1733,7 +1769,6 @@ function saveState() {
   const state = {
     scanPath: FILE_BROWSER.scanPath,
     extFilter: document.getElementById("ext-filter")?.value || ".jpg,.jpeg,.png",
-    outputDir: document.getElementById("output-dir")?.value || "./pose_results/",
   };
   try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch {}
 }
@@ -1746,8 +1781,6 @@ function loadState() {
     if (state.scanPath) FILE_BROWSER.scanPath = state.scanPath;
     const extInput = document.getElementById("ext-filter");
     if (extInput && state.extFilter) extInput.value = state.extFilter;
-    const outInput = document.getElementById("output-dir");
-    if (outInput && state.outputDir) outInput.value = state.outputDir;
     const scanInput = document.getElementById("folder-path");
     if (scanInput && state.scanPath) scanInput.value = state.scanPath;
   } catch {}
