@@ -1225,6 +1225,17 @@ function ensureMonaco() {
       require.config({ paths: { vs: MONACO_VS } });
       require(["vs/editor/editor.main"], () => {
         try {
+          // Processor bodies reference injected globals (o_img, console,
+          // f_save_filtered, …). Keep syntax validation so real parse errors
+          // squiggle, but turn off semantic validation so those globals don't
+          // get flagged as "cannot find name".
+          try {
+            monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+              noSemanticValidation: true,
+              noSyntaxValidation: false,
+            });
+          } catch { /* older Monaco — ignore */ }
+
           STATE.monacoEditor = monaco.editor.create(DOM.monacoHost, {
             value: "",
             language: "javascript",
@@ -1236,6 +1247,11 @@ function ensureMonaco() {
             tabSize: 2,
             lineNumbers: "on",
           });
+
+          // Drop our custom error markers as soon as the user edits, so stale
+          // highlights don't linger after the offending code is changed.
+          STATE.monacoEditor.onDidChangeModelContent(() => clearEditorErrorMarkers());
+
           resolve();
         } catch {
           fallback();
@@ -1493,7 +1509,118 @@ function setEditorMessage(text, kind) {
   DOM.editorMessage.className = "editor-message" + (kind ? " " + kind : "");
 }
 
-function saveProcessor() {
+// ---- Processor error highlighting (Monaco) ----
+
+const PROCESSOR_MARKER_OWNER = "processor-error";
+
+function tsMessageText(messageText) {
+  // TS diagnostics are either a string or a chained {messageText, next} object.
+  return typeof messageText === "string"
+    ? messageText
+    : (messageText && messageText.messageText) || "Syntax error";
+}
+
+// Locate syntax errors in arbitrary processor code using Monaco's JS language
+// service. Returns an array of marker-shaped objects (with 1-based line/column),
+// or null when Monaco isn't available (offline / fallback textarea).
+async function locateSyntaxErrors(code) {
+  if (typeof monaco === "undefined" || !monaco.languages || !monaco.languages.typescript) {
+    return null;
+  }
+  let model = null;
+  try {
+    const uri = monaco.Uri.parse(`inmemory://proc-check/${STATE._procCheckSeq = (STATE._procCheckSeq || 0) + 1}.js`);
+    model = monaco.editor.createModel(code, "javascript", uri);
+    const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+    const worker = await getWorker(model.uri);
+    const diags = await worker.getSyntacticDiagnostics(model.uri.toString());
+    if (!diags || diags.length === 0) return [];
+    return diags.map((d) => {
+      const start = model.getPositionAt(d.start);
+      const end = model.getPositionAt(d.start + (d.length || 1));
+      return {
+        startLineNumber: start.lineNumber,
+        startColumn: start.column,
+        endLineNumber: end.lineNumber,
+        endColumn: end.column,
+        message: tsMessageText(d.messageText),
+      };
+    });
+  } catch {
+    return null;
+  } finally {
+    if (model) model.dispose();
+  }
+}
+
+// Best-effort {line, column} for an error thrown while EXECUTING a processor.
+// Processors are compiled with new Function(...args, body); in V8 the generated
+// wrapper is "function anonymous(<args>\n) {\n<body…>", so body line 1 lands on
+// generated line 3 — subtract that offset to map back to editor lines.
+function locateRuntimeError(error) {
+  const stack = error && typeof error.stack === "string" ? error.stack : "";
+  const BODY_LINE_OFFSET = 2;
+  // V8 names the compiled wrapper "anonymous"/"<anonymous>"; the body frame is
+  // the first one referencing it. Fall back to the first line:col pair if the
+  // wrapper isn't named (other engines).
+  const patterns = [
+    /<anonymous>:(\d+):(\d+)/,
+    /\banonymous:(\d+):(\d+)/,
+    /:(\d+):(\d+)/,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(stack);
+    if (m) {
+      const line = Number(m[1]) - BODY_LINE_OFFSET;
+      if (line >= 1) return { line, column: Number(m[2]) };
+    }
+  }
+  return null;
+}
+
+function clearEditorErrorMarkers() {
+  if (typeof monaco === "undefined" || !STATE.monacoEditor) return;
+  const model = STATE.monacoEditor.getModel();
+  if (model) monaco.editor.setModelMarkers(model, PROCESSOR_MARKER_OWNER, []);
+}
+
+// Mark the given positions as errors in the editor and jump to the first one.
+function highlightEditorErrors(markers) {
+  if (typeof monaco === "undefined" || !STATE.monacoEditor || !markers || !markers.length) {
+    return;
+  }
+  const model = STATE.monacoEditor.getModel();
+  if (!model) return;
+  monaco.editor.setModelMarkers(
+    model,
+    PROCESSOR_MARKER_OWNER,
+    markers.map((m) => ({
+      severity: monaco.MarkerSeverity.Error,
+      message: m.message,
+      startLineNumber: m.startLineNumber,
+      startColumn: m.startColumn,
+      endLineNumber: m.endLineNumber,
+      endColumn: m.endColumn,
+    })),
+  );
+  const first = markers[0];
+  STATE.monacoEditor.revealLineInCenter(first.startLineNumber);
+  STATE.monacoEditor.setPosition({
+    lineNumber: first.startLineNumber,
+    column: first.startColumn,
+  });
+  STATE.monacoEditor.focus();
+}
+
+// True when the editor currently shows the processor with this name.
+function isProcessorOpen(name) {
+  return !!(DOM.editorPanel &&
+    !DOM.editorPanel.classList.contains("hidden") &&
+    DOM.processorName &&
+    DOM.processorName.value.trim() === name);
+}
+
+async function saveProcessor() {
   const name = DOM.processorName.value.trim();
   const code = getEditorCode();
   const active = DOM.processorActive.checked;
@@ -1504,10 +1631,23 @@ function saveProcessor() {
   }
 
   // Validate the code compiles before saving so users get immediate feedback.
+  clearEditorErrorMarkers();
   try {
     new Function(...PROCESSOR_ARG_NAMES, code);
   } catch (e) {
-    setEditorMessage(`Syntax error: ${e.message}`, "error");
+    // new Function's SyntaxError has no usable position; ask Monaco where it is
+    // and highlight it directly in the editor.
+    const markers = await locateSyntaxErrors(code);
+    if (markers && markers.length) {
+      highlightEditorErrors(markers);
+      const f = markers[0];
+      setEditorMessage(
+        `Syntax error (line ${f.startLineNumber}, col ${f.startColumn}): ${f.message}`,
+        "error",
+      );
+    } else {
+      setEditorMessage(`Syntax error: ${e.message}`, "error");
+    }
     return;
   }
 
@@ -1599,8 +1739,19 @@ async function runProcessors() {
         fn: new Function(...PROCESSOR_ARG_NAMES, p.code),
       });
     } catch (e) {
+      const markers = await locateSyntaxErrors(p.code);
+      const f = markers && markers[0];
+      // If this processor is the one open in the editor, highlight it there.
+      if (f && isProcessorOpen(p.name)) {
+        highlightEditorErrors(markers);
+        setEditorMessage(
+          `Syntax error (line ${f.startLineNumber}, col ${f.startColumn}): ${f.message}`,
+          "error",
+        );
+      }
+      const where = f ? ` (line ${f.startLineNumber}, col ${f.startColumn})` : "";
       updateFilterStatusText(
-        `Processor "${p.name}" has a syntax error: ${e.message}`,
+        `Processor "${p.name}" has a syntax error${where}: ${f ? f.message : e.message}`,
         true,
       );
       return;
@@ -1641,6 +1792,8 @@ async function handleAllPoseData(msg) {
   const filtered = {};
   let passed = 0;
   let errors = 0;
+  // First runtime error seen per processor: name -> { error, loc, image }.
+  const procErrors = new Map();
 
   // Resolve image dimensions with limited concurrency so we don't open
   // hundreds of image requests at once.
@@ -1681,6 +1834,13 @@ async function handleAllPoseData(msg) {
       } catch (e) {
         errors++;
         // A throwing processor neither keeps nor filters; record and continue.
+        if (!procErrors.has(proc.name)) {
+          procErrors.set(proc.name, {
+            error: e,
+            loc: locateRuntimeError(e),
+            image: o_img.s_name_file,
+          });
+        }
         console.error(
           `Processor "${proc.name}" threw on ${o_img.s_name_file}:`,
           e,
@@ -1707,8 +1867,30 @@ async function handleAllPoseData(msg) {
   const filteredCount = Object.keys(filtered).length;
   let summary =
     `Done: ${passed} kept, ${filteredCount} filtered out of ${items.length}.`;
-  if (errors > 0) summary += ` ${errors} processor error(s) — see console.`;
-  updateFilterStatusText(summary, filteredCount > 0);
+  if (errors > 0) {
+    const [name, info] = [...procErrors.entries()][0];
+    const emsg = info.error && info.error.message
+      ? info.error.message
+      : String(info.error);
+    const where = info.loc ? ` (line ${info.loc.line}, col ${info.loc.column})` : "";
+    summary += ` ${errors} processor error(s). "${name}"${where}: ${emsg}` +
+      ` — e.g. on ${info.image}.`;
+    // Highlight in the editor if that processor is the one being edited.
+    if (info.loc && isProcessorOpen(name)) {
+      highlightEditorErrors([{
+        startLineNumber: info.loc.line,
+        startColumn: info.loc.column,
+        endLineNumber: info.loc.line,
+        endColumn: info.loc.column + 1,
+        message: emsg,
+      }]);
+      setEditorMessage(
+        `Runtime error (line ${info.loc.line}, col ${info.loc.column}): ${emsg}`,
+        "error",
+      );
+    }
+  }
+  updateFilterStatusText(summary, filteredCount > 0 || errors > 0);
 }
 
 function updateFilterStatusText(text, highlight) {
