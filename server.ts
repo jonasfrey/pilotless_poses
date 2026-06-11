@@ -680,6 +680,63 @@ async function saveManifest(outputDir: string, manifest: Manifest): Promise<void
   );
 }
 
+// Reconcile the manifest against the pose JSON files actually on disk — files
+// are the source of truth. Two directions of drift are repaired:
+//   - an "ok" entry whose result file has vanished is dropped (the data is
+//     genuinely gone); "error" entries are kept (their file was never written)
+//   - a <name>_pose.json present on disk but absent from the manifest is
+//     surfaced as a fresh "ok" entry (e.g. the manifest was deleted while the
+//     results remained). The source image path is read back from the file's
+//     own "image" field.
+// The repaired manifest is persisted so subsequent reads are consistent.
+async function reconcileManifestWithDisk(outputDir: string): Promise<Manifest> {
+  const manifest = await loadManifest(outputDir);
+  let changed = false;
+
+  // Drop "ok" entries whose pose JSON has disappeared. pathExists (not a raw
+  // string match) so absolute paths from manifests created elsewhere still
+  // resolve correctly.
+  const kept: ManifestEntry[] = [];
+  for (const e of manifest.results) {
+    if (e.status === "ok" && !(await pathExists(e.result))) {
+      changed = true;
+      continue;
+    }
+    kept.push(e);
+  }
+
+  // Surface pose JSON files on disk the manifest doesn't know about.
+  const knownSources = new Set(kept.map((e) => e.source));
+  try {
+    for await (const entry of Deno.readDir(outputDir)) {
+      if (!entry.isFile || !entry.name.endsWith("_pose.json")) continue;
+      const resultPath = `${outputDir}/${entry.name}`;
+      try {
+        const parsed = JSON.parse(await Deno.readTextFile(resultPath));
+        const source = typeof parsed.image === "string" ? parsed.image : null;
+        if (!source || knownSources.has(source)) continue;
+        kept.push({ source, result: resultPath, status: "ok" });
+        knownSources.add(source);
+        changed = true;
+      } catch {
+        // Unreadable / not JSON — skip it.
+      }
+    }
+  } catch {
+    // Output dir doesn't exist yet — nothing on disk to discover.
+  }
+
+  manifest.results = kept;
+  if (changed) {
+    try {
+      await saveManifest(outputDir, manifest);
+    } catch {
+      // Non-fatal: still return the reconciled view even if we can't persist it.
+    }
+  }
+  return manifest;
+}
+
 // ---- WebSocket Connection Manager -------------------------------------------
 
 interface ScanState {
@@ -827,40 +884,92 @@ async function handleScanFolder(
     manifest.source_folder = folderPath;
     manifest.output_dir = outputDir;
 
-    // Remove stale entries for images being reprocessed. entry.source stores
-    // the full image path, so compare against the full paths (not basenames),
-    // otherwise old entries are never dropped and duplicates accumulate.
+    // Skip images that already have a pose JSON on disk. The per-image
+    // <name>_pose.json file is the source of truth (files always win): if it
+    // exists we trust it and don't re-run inference, so re-scanning a folder is
+    // idempotent and only processes images that are genuinely new. This path
+    // matches what onResult writes, so reconciliation lines up exactly.
+    const resultPathFor = (img: string) =>
+      `${outputDir}/${img.split("/").pop()!.replace(/\.[^.]+$/, "")}_pose.json`;
+    const toProcess: string[] = [];
+    const alreadyDone: string[] = [];
+    for (const img of images) {
+      if (await isFile(resultPathFor(img))) alreadyDone.push(img);
+      else toProcess.push(img);
+    }
+
+    // Re-derive this scan's manifest entries from authoritative state. Drop any
+    // existing entries for these images (full-path match — entry.source stores
+    // the full path), then re-add an `ok` entry for every already-done image
+    // straight from its file on disk. New images get their entries from
+    // onResult as inference produces them.
     const imageSet = new Set(images);
     manifest.results = manifest.results.filter((entry) =>
       !imageSet.has(entry.source)
     );
+    for (const img of alreadyDone) {
+      manifest.results.push({ source: img, result: resultPathFor(img), status: "ok" });
+    }
+
+    if (alreadyDone.length > 0) {
+      log(
+        `${alreadyDone.length} of ${images.length} image(s) already processed ` +
+          `— skipping. ${toProcess.length} to do.`,
+      );
+    }
 
     // Create the global scan state (survives the originating socket closing).
+    // Already-done images count as processed up front so progress is accurate.
     const scanState: ScanState = {
       abortController,
       total: images.length,
-      processed: 0,
+      processed: alreadyDone.length,
       errors: [],
       scanning: true,
     };
     activeScan = scanState;
 
-    // Send queued status for all files
-    for (const img of images) {
+    // Reflect already-done images as completed immediately.
+    for (const img of alreadyDone) {
       connManager.broadcast({
         type: "progress",
-        current: 0,
+        current: scanState.processed,
+        total: images.length,
+        file: img.split("/").pop()!,
+        status: "done",
+      });
+    }
+
+    // Nothing new to process: persist the reconciled manifest and finish. This
+    // is the common case when re-scanning a folder that's already been done —
+    // the scan is now a fast no-op instead of a full recompute.
+    if (toProcess.length === 0) {
+      await saveManifest(outputDir, manifest);
+      log(`All ${images.length} image(s) already processed — nothing to do.`);
+      connManager.broadcast({
+        type: "batch_complete",
+        total: images.length,
+        errors: [],
+      });
+      scanState.scanning = false;
+      if (activeScan === scanState) activeScan = null;
+      return;
+    }
+
+    // Send queued, then processing, status for the images we will actually run.
+    for (const img of toProcess) {
+      connManager.broadcast({
+        type: "progress",
+        current: scanState.processed,
         total: images.length,
         file: img.split("/").pop()!,
         status: "queued",
       });
     }
-
-    // Send processing status for all files
-    for (const img of images) {
+    for (const img of toProcess) {
       connManager.broadcast({
         type: "progress",
-        current: 0,
+        current: scanState.processed,
         total: images.length,
         file: img.split("/").pop()!,
         status: "processing",
@@ -948,7 +1057,7 @@ async function handleScanFolder(
       log("Launching VitPose inference (this can take a while on first run)…");
       const summary = await runPythonBatchInference(
         config.pythonPath,
-        images,
+        toProcess,
         modelDir,
         abortController.signal,
         (line) => log(line, "python"),
@@ -963,8 +1072,8 @@ async function handleScanFolder(
       const errorMsg = e instanceof Error ? e.message : String(e);
       log(`Inference failed: ${errorMsg}`, "error");
 
-      // Mark every image not yet recorded as errored.
-      for (const imagePath of images) {
+      // Mark every image we tried to process but didn't record as errored.
+      for (const imagePath of toProcess) {
         const basename = imagePath.split("/").pop()!;
         if (manifest.results.some((r) => r.source === imagePath)) continue;
         scanState.errors.push({ file: basename, error: errorMsg });
@@ -1025,18 +1134,12 @@ async function handleGetResults(
   _msg: GetResultsMessage,
   connManager: ConnectionManager,
 ): Promise<void> {
-  // The pose preview always shows ALL scanned results from the single
-  // manifest in OUTPUT_DIR — it is not scoped to any selected folder.
-  const manifestPath = `${OUTPUT_DIR}/manifest.json`;
-  console.log(`[get_results] reading ${manifestPath} (cwd: ${Deno.cwd()})`);
-
-  if (!(await pathExists(manifestPath))) {
-    console.warn(`[get_results] no manifest at ${manifestPath} — returning 0 results`);
-    connManager.send(ws, { type: "results_list", results: [] });
-    return;
-  }
-
-  const manifest = await loadManifest(OUTPUT_DIR);
+  // The pose preview always shows ALL scanned results from the single manifest
+  // in OUTPUT_DIR — it is not scoped to any selected folder. Reconcile against
+  // the files on disk first (files always win) so a deleted manifest, a vanished
+  // result file, or pose JSONs produced out-of-band are all reflected correctly.
+  console.log(`[get_results] reconciling manifest in ${OUTPUT_DIR} (cwd: ${Deno.cwd()})`);
+  const manifest = await reconcileManifestWithDisk(OUTPUT_DIR);
 
   // Dedupe by source, keeping the most recent entry. Older manifests written
   // before the dedup fix can contain repeated entries for the same image.
@@ -1514,14 +1617,50 @@ const INFERENCE_MODELS_PATH = "./inference_models.json";
 const INFERENCE_MODELS_DIR = "./inference_models";
 const INFERENCE_SCRIPT = "python/f_o_train_inference.py";
 
+// Ids of models training in THIS server process. Lets us tell a genuinely
+// in-flight "training" status apart from one orphaned by a server restart.
+const activeTrainings = new Set<string>();
+
 async function loadInferenceModels(): Promise<InferenceModel[]> {
+  let models: InferenceModel[];
   try {
     const raw = await Deno.readTextFile(INFERENCE_MODELS_PATH);
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed as InferenceModel[] : [];
+    models = Array.isArray(parsed) ? parsed as InferenceModel[] : [];
   } catch {
     return []; // first run or unreadable — start empty
   }
+
+  // Reconcile persisted status against reality — live tasks and files win:
+  //   - "training" with no live training task in this process was orphaned by a
+  //     restart/crash; reset to "error" so the user can retrain (otherwise the
+  //     UI disables Train forever).
+  //   - "trained" with no .joblib on disk means the artifact is gone (deleted,
+  //     or a models.json copied without its model files); reset to "untrained"
+  //     so the UI doesn't offer Apply for a model that can't run.
+  let changed = false;
+  for (const m of models) {
+    if (m.status === "training" && !activeTrainings.has(m.id)) {
+      m.status = "error";
+      m.error = "Training was interrupted (server restarted). Train again.";
+      m.updatedAt = new Date().toISOString();
+      changed = true;
+    } else if (m.status === "trained" && !(await isFile(modelFilePath(m.id)))) {
+      m.status = "untrained";
+      m.metrics = undefined;
+      m.error = "Trained model file is missing — retrain.";
+      m.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) {
+    try {
+      await saveInferenceModels(models);
+    } catch {
+      // Non-fatal: still return the reconciled view even if we can't persist it.
+    }
+  }
+  return models;
 }
 
 async function saveInferenceModels(models: InferenceModel[]): Promise<void> {
@@ -1686,6 +1825,23 @@ function logToClient(
 }
 
 async function handleTrainInferenceModel(
+  ws: WebSocket,
+  msg: TrainInferenceModelMessage,
+  config: AppConfig,
+  connManager: ConnectionManager,
+): Promise<void> {
+  // Register as a live training so reconciliation in loadInferenceModels() does
+  // not mistake this model's persisted "training" status for an orphaned one
+  // (it gets saved to disk below, then reloaded mid-run).
+  activeTrainings.add(msg.id);
+  try {
+    await trainInferenceModelInner(ws, msg, config, connManager);
+  } finally {
+    activeTrainings.delete(msg.id);
+  }
+}
+
+async function trainInferenceModelInner(
   ws: WebSocket,
   msg: TrainInferenceModelMessage,
   config: AppConfig,
@@ -1863,13 +2019,10 @@ async function handleGetAllPoseData(
   _msg: GetAllPoseDataMessage,
   connManager: ConnectionManager,
 ): Promise<void> {
-  // Operate on the same single manifest the preview page loads.
-  if (!(await pathExists(`${OUTPUT_DIR}/manifest.json`))) {
-    connManager.send(ws, { type: "all_pose_data", items: [] });
-    return;
-  }
-
-  const manifest = await loadManifest(OUTPUT_DIR);
+  // Operate on the same single manifest the preview page loads, reconciled
+  // against disk (files win) so processors run on exactly what's shown — even
+  // if the manifest was deleted or an entry went stale.
+  const manifest = await reconcileManifestWithDisk(OUTPUT_DIR);
 
   if (manifest.results.length === 0) {
     connManager.send(ws, { type: "all_pose_data", items: [] });

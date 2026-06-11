@@ -391,10 +391,33 @@ function handleBatchComplete(msg) {
     DOM.progressSummary.textContent =
       `Batch complete: ${ok} of ${msg.total} images processed successfully. ${STATE.errors.length} errors.`;
   }
+
+  // A scan changes what's on disk. If the preview is currently showing, re-fetch
+  // results (and the processor / model lists) so it reflects the new state
+  // instead of waiting for the user to re-navigate to the tab.
+  const previewActive =
+    document.getElementById("page-preview")?.classList.contains("active");
+  if (previewActive) {
+    loadResults();
+    sendMessage({ type: "list_processors" });
+    sendMessage({ type: "list_inference_models" });
+  }
 }
 
 function handleResultsList(msg) {
   STATE.results = msg.results || [];
+
+  // A fresh result set invalidates any prior processor / inference filtering:
+  // those maps are keyed by result path and were computed against the OLD set,
+  // so they'd otherwise keep hiding images that were never re-evaluated. Clear
+  // them and the inference-filter UI so the preview reflects the server's actual
+  // state; the user re-runs processors / re-applies a model explicitly.
+  STATE.filteredOut = {};
+  STATE.inferenceFilteredOut = {};
+  STATE.appliedInferenceId = null;
+  if (DOM.btnClearInference) DOM.btnClearInference.classList.add("hidden");
+  setInferenceFilterStatus("");
+
   console.log(
     "[handleResultsList] received",
     STATE.results.length,
