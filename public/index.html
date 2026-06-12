@@ -15,6 +15,7 @@
       <button id="nav-preview" class="nav-tab" data-page="preview">Image Preview</button>
       <button id="nav-processors" class="nav-tab" data-page="processors">Processors</button>
       <button id="nav-inference" class="nav-tab" data-page="inference">Inference Models</button>
+      <button id="nav-basetags" class="nav-tab" data-page="basetags">Basetags</button>
     </nav>
     <button id="btn-toggle-log" class="btn btn-sm log-toggle" title="Show/hide the live server log (visible from any page)">
       Live Log
@@ -129,6 +130,14 @@
             <span class="tag-row-label">Active tag</span>
             <input type="text" id="active-tag" class="tag-input" placeholder="tag name" value="marked_hands_in_the_air">
           </div>
+          <div class="tag-row basetag-row" title="Pick a basetag, then press ↑ to mark this image positive or ↓ to mark it negative. The image is copied into the matching folder automatically.">
+            <span class="tag-row-label">Basetag</span>
+            <select id="basetag-select" class="tag-input">
+              <option value="">— none —</option>
+            </select>
+          </div>
+          <p class="hint basetag-hint">↑ = <code>_positive</code> · ↓ = <code>_negative</code> · same key again clears it</p>
+          <div id="basetag-status" class="processor-filter-status"></div>
           <div id="processor-filter-status" class="processor-filter-status"></div>
           <div class="export-row" title="Copy the images that passed your filters (and their pose JSON) into this folder">
             <input type="text" id="export-folder" class="export-folder-input" placeholder="folder name" value="filtered_images">
@@ -361,6 +370,13 @@
             </p>
 
             <div class="form-group">
+              <label for="inference-basetag">Basetag (optional — fills both folders below)</label>
+              <select id="inference-basetag">
+                <option value="">— none —</option>
+              </select>
+            </div>
+
+            <div class="form-group">
               <label for="inference-pos-dir">Positive examples folder</label>
               <div class="input-row">
                 <input type="text" id="inference-pos-dir" placeholder="e.g. ./filtered_images"
@@ -405,6 +421,60 @@
             </div>
 
             <p class="hint">Training progress streams to the <strong>Live Log</strong> tab.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- Page 5: Basetags                                                    -->
+  <!-- ================================================================== -->
+  <main id="page-basetags" class="page">
+    <section class="card" id="basetags-main">
+      <h2>Basetags</h2>
+      <div class="processors-layout">
+        <!-- Basetag list sidebar -->
+        <aside class="processor-sidebar">
+          <div class="sidebar-header">
+            <h3>Basetags</h3>
+            <span id="basetag-count" class="badge">0</span>
+          </div>
+          <button id="btn-new-basetag" class="btn btn-primary btn-sm">+ New Basetag</button>
+          <div id="basetag-list" class="processor-list">
+            <div class="placeholder">No basetags yet. Create one to get started.</div>
+          </div>
+        </aside>
+
+        <!-- Editor panel -->
+        <div class="processor-editor-area" id="basetag-editor-area">
+          <div class="editor-placeholder" id="basetag-editor-placeholder">
+            Select a basetag to edit, or create a new one.
+          </div>
+          <div class="editor-panel hidden" id="basetag-editor-panel">
+            <div class="form-group">
+              <label for="basetag-name">Name</label>
+              <input type="text" id="basetag-name" placeholder="e.g. hands_in_the_air"
+                     autocomplete="off" spellcheck="false">
+            </div>
+
+            <p class="hint editor-hint">
+              A basetag is a base name. In the <strong>Image Preview</strong>, pick it and press
+              <strong>↑</strong> to mark an image <code>&lt;name&gt;_positive</code> or <strong>↓</strong>
+              for <code>&lt;name&gt;_negative</code> — the image (and its pose JSON) is copied into the
+              matching folder automatically. On the <strong>Inference Models</strong> page, selecting it
+              fills both folder fields. Use letters, digits, <code>_</code> or <code>-</code> only.
+            </p>
+
+            <div id="basetag-editor-message" class="editor-message"></div>
+
+            <div class="actions">
+              <button id="btn-save-basetag" class="btn btn-primary">Save</button>
+              <button id="btn-delete-basetag" class="btn btn-danger hidden">Delete</button>
+              <button id="btn-cancel-basetag" class="btn btn-secondary">Cancel</button>
+            </div>
+
+            <p class="hint">Deleting a basetag does not remove its <code>_positive</code>/<code>_negative</code> folders on disk.</p>
           </div>
         </div>
       </div>

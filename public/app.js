@@ -51,6 +51,12 @@ const STATE = {
   monacoEditor: null,
   monacoLoading: null,     // Promise while Monaco is loading
 
+  // Basetag state
+  basetags: [],                // { id, name, createdAt, updatedAt }
+  editingBasetagId: null,      // id being edited, or "__new__" for an unsaved one
+  pendingSelectBasetagName: null, // resolve a freshly-saved "__new__" to its id
+  selectedBasetagId: null,     // basetag chosen in the preview (persisted)
+
   // Inference model state
   inferenceModels: [],         // { id, name, positiveDir, negativeDir, status, metrics, ... }
   editingInferenceId: null,    // id being edited, or "__new__" for an unsaved one
@@ -130,6 +136,10 @@ function connectWebSocket() {
 
     // Load initial file browser listing — restore saved path if any
     navigateBrowserTo("scan", FILE_BROWSER.scanPath);
+
+    // Basetags are needed by the preview + inference selectors regardless of
+    // which page is shown first, so load them up front.
+    sendMessage({ type: "list_basetags" });
   });
 
   STATE.ws.addEventListener("message", (event) => {
@@ -539,6 +549,12 @@ function handleMessage(msg) {
     case "export_result":
       handleExportResult(msg);
       break;
+    case "unexport_result":
+      handleUnexportResult(msg);
+      break;
+    case "basetags_list":
+      handleBasetagsList(msg);
+      break;
     case "scan_log":
       handleScanLog(msg);
       break;
@@ -833,6 +849,12 @@ function navigateTo(page) {
   // Load inference models when entering the inference models page
   if (page === "inference") {
     sendMessage({ type: "list_inference_models" });
+    sendMessage({ type: "list_basetags" });
+  }
+
+  // Load basetags when entering the basetags page
+  if (page === "basetags") {
+    sendMessage({ type: "list_basetags" });
   }
 }
 
@@ -2054,6 +2076,14 @@ function handleKeyboard(e) {
       e.preventDefault();
       navigateImages(1);
       break;
+    case "arrowup":
+      e.preventDefault();
+      labelCurrent(1);
+      break;
+    case "arrowdown":
+      e.preventDefault();
+      labelCurrent(-1);
+      break;
     case "h":
       e.preventDefault();
       toggleOverlay();
@@ -3004,6 +3034,7 @@ function saveState() {
     extFilter: document.getElementById("ext-filter")?.value || ".jpg,.jpeg,.png",
     exportFolder: STATE.exportFolder,
     activeTag: STATE.activeTag,
+    selectedBasetagId: STATE.selectedBasetagId,
     invertFilter: STATE.invertFilter,
     limitCount: STATE.limitCount,
   };
@@ -3018,6 +3049,7 @@ function loadState() {
     if (state.scanPath) FILE_BROWSER.scanPath = state.scanPath;
     if (state.exportFolder) STATE.exportFolder = state.exportFolder;
     if (typeof state.activeTag === "string") STATE.activeTag = state.activeTag;
+    if (typeof state.selectedBasetagId === "string") STATE.selectedBasetagId = state.selectedBasetagId;
     if (typeof state.invertFilter === "boolean") STATE.invertFilter = state.invertFilter;
     if (typeof state.limitCount === "number") STATE.limitCount = state.limitCount;
     const extInput = document.getElementById("ext-filter");
@@ -3705,6 +3737,280 @@ function setInferenceFilterStatus(text, highlight) {
 }
 
 // ============================================================================
+// Page 5: Basetags
+// ============================================================================
+// A basetag is a single base name (e.g. "hands_in_the_air"). It drives a
+// keyboard labelling workflow on the preview page (↑ → `${name}_positive`,
+// ↓ → `${name}_negative`, with the image auto-copied into the matching folder)
+// and auto-fills the positive/negative dirs on the inference page.
+
+// Slug-safe names so they map cleanly onto tag + on-disk folder names. Mirrors
+// BASETAG_NAME_RE in server.ts.
+const BASETAG_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+function initBasetagsPage() {
+  DOM.basetagList = document.getElementById("basetag-list");
+  DOM.basetagCount = document.getElementById("basetag-count");
+  DOM.basetagEditorPlaceholder = document.getElementById("basetag-editor-placeholder");
+  DOM.basetagEditorPanel = document.getElementById("basetag-editor-panel");
+  DOM.basetagName = document.getElementById("basetag-name");
+  DOM.basetagEditorMessage = document.getElementById("basetag-editor-message");
+  DOM.btnSaveBasetag = document.getElementById("btn-save-basetag");
+  DOM.btnDeleteBasetag = document.getElementById("btn-delete-basetag");
+  DOM.btnCancelBasetag = document.getElementById("btn-cancel-basetag");
+
+  document.getElementById("btn-new-basetag").addEventListener("click", newBasetag);
+  DOM.btnSaveBasetag.addEventListener("click", saveBasetag);
+  DOM.btnDeleteBasetag.addEventListener("click", deleteBasetag);
+  DOM.btnCancelBasetag.addEventListener("click", closeBasetagEditor);
+  DOM.basetagName.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); saveBasetag(); }
+  });
+
+  // Preview-page basetag selector (drives the ↑/↓ labelling).
+  DOM.basetagSelect = document.getElementById("basetag-select");
+  DOM.basetagStatus = document.getElementById("basetag-status");
+  if (DOM.basetagSelect) {
+    DOM.basetagSelect.addEventListener("change", () => {
+      STATE.selectedBasetagId = DOM.basetagSelect.value || null;
+      saveState();
+      setBasetagStatus(
+        STATE.selectedBasetagId
+          ? `Basetag “${selectedBasetagName()}” — ↑ positive · ↓ negative`
+          : "",
+      );
+    });
+  }
+
+  // Inference-page basetag selector — fills the positive/negative dir fields.
+  DOM.inferenceBasetag = document.getElementById("inference-basetag");
+  if (DOM.inferenceBasetag) {
+    DOM.inferenceBasetag.addEventListener("change", () => {
+      const b = STATE.basetags.find((x) => x.id === DOM.inferenceBasetag.value);
+      if (!b) return;
+      if (DOM.inferencePosDir) DOM.inferencePosDir.value = `${b.name}_positive`;
+      if (DOM.inferenceNegDir) DOM.inferenceNegDir.value = `${b.name}_negative`;
+      setInferenceMessage(`Folders set from basetag “${b.name}”. Edit if needed, then Save.`);
+    });
+  }
+
+  populateBasetagSelectors();
+}
+
+function handleBasetagsList(msg) {
+  STATE.basetags = msg.basetags || [];
+  if (msg.error) {
+    console.error("basetags error:", msg.error);
+    setBasetagMessage(msg.error, "error");
+  }
+
+  // Resolve a freshly-saved "__new__" basetag to its concrete id so the editor
+  // stays on it and Delete becomes available.
+  if (STATE.pendingSelectBasetagName) {
+    const b = STATE.basetags.find((x) => x.name === STATE.pendingSelectBasetagName);
+    if (b) {
+      STATE.editingBasetagId = b.id;
+      STATE.pendingSelectBasetagName = null;
+      DOM.btnDeleteBasetag?.classList.remove("hidden");
+    }
+  }
+
+  renderBasetagList();
+  populateBasetagSelectors();
+}
+
+function renderBasetagList() {
+  const list = DOM.basetagList;
+  if (!list) return;
+  list.innerHTML = "";
+  if (DOM.basetagCount) DOM.basetagCount.textContent = String(STATE.basetags.length);
+
+  if (STATE.basetags.length === 0) {
+    list.innerHTML =
+      '<div class="placeholder">No basetags yet. Create one to get started.</div>';
+    return;
+  }
+
+  STATE.basetags.forEach((b) => {
+    const div = document.createElement("div");
+    div.className = "processor-entry";
+    if (b.id === STATE.editingBasetagId) div.classList.add("active");
+    const name = document.createElement("span");
+    name.className = "p-name";
+    name.textContent = b.name;
+    name.title = b.name;
+    div.appendChild(name);
+    div.addEventListener("click", () => editBasetag(b.id));
+    list.appendChild(div);
+  });
+}
+
+function openBasetagEditor() {
+  DOM.basetagEditorPlaceholder.classList.add("hidden");
+  DOM.basetagEditorPanel.classList.remove("hidden");
+}
+
+function closeBasetagEditor() {
+  STATE.editingBasetagId = null;
+  DOM.basetagEditorPanel.classList.add("hidden");
+  DOM.basetagEditorPlaceholder.classList.remove("hidden");
+  setBasetagMessage("");
+  renderBasetagList();
+}
+
+function newBasetag() {
+  STATE.editingBasetagId = "__new__";
+  openBasetagEditor();
+  DOM.basetagName.value = "";
+  DOM.btnDeleteBasetag.classList.add("hidden");
+  setBasetagMessage("Enter a name, then Save.");
+  renderBasetagList();
+  DOM.basetagName.focus();
+}
+
+function editBasetag(id) {
+  const b = STATE.basetags.find((x) => x.id === id);
+  if (!b) return;
+  STATE.editingBasetagId = id;
+  openBasetagEditor();
+  DOM.basetagName.value = b.name;
+  DOM.btnDeleteBasetag.classList.remove("hidden");
+  setBasetagMessage("");
+  renderBasetagList();
+}
+
+function saveBasetag() {
+  const name = DOM.basetagName.value.trim();
+  if (!name) {
+    setBasetagMessage("Please give the basetag a name.", "error");
+    return;
+  }
+  if (!BASETAG_NAME_RE.test(name)) {
+    setBasetagMessage("Use letters, digits, _ or - only (no spaces).", "error");
+    return;
+  }
+  const id = STATE.editingBasetagId === "__new__" ? undefined : STATE.editingBasetagId;
+  const sent = sendMessage({ type: "save_basetag", basetag: { id, name } });
+  if (!sent) {
+    setBasetagMessage("Not connected — could not save.", "error");
+    return;
+  }
+  if (!id) STATE.pendingSelectBasetagName = name;
+  setBasetagMessage("Saved.", "success");
+}
+
+function deleteBasetag() {
+  if (!STATE.editingBasetagId || STATE.editingBasetagId === "__new__") {
+    closeBasetagEditor();
+    return;
+  }
+  const b = STATE.basetags.find((x) => x.id === STATE.editingBasetagId);
+  if (b && !confirm(`Delete basetag "${b.name}"? Its folders on disk are kept.`)) return;
+  sendMessage({ type: "delete_basetag", id: STATE.editingBasetagId });
+  closeBasetagEditor();
+}
+
+function setBasetagMessage(text, kind) {
+  if (!DOM.basetagEditorMessage) return;
+  DOM.basetagEditorMessage.textContent = text || "";
+  DOM.basetagEditorMessage.className = "editor-message" + (kind ? " " + kind : "");
+}
+
+function setBasetagStatus(text, highlight) {
+  const el = DOM.basetagStatus;
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("has-filter", !!highlight);
+}
+
+// Fill both the preview and inference basetag <select>s from STATE.basetags,
+// preserving the current selection where it still exists.
+function populateBasetagSelectors() {
+  const fill = (sel, keepValue) => {
+    if (!sel) return;
+    sel.innerHTML = '<option value="">— none —</option>';
+    for (const b of STATE.basetags) {
+      const opt = document.createElement("option");
+      opt.value = b.id;
+      opt.textContent = b.name;
+      sel.appendChild(opt);
+    }
+    sel.value = STATE.basetags.some((b) => b.id === keepValue) ? keepValue : "";
+  };
+
+  // Preview selector mirrors STATE.selectedBasetagId; drop a stale selection.
+  const sel = DOM.basetagSelect || document.getElementById("basetag-select");
+  if (sel) {
+    fill(sel, STATE.selectedBasetagId || "");
+    if (STATE.selectedBasetagId && sel.value === "") {
+      STATE.selectedBasetagId = null;
+      saveState();
+    }
+  }
+
+  // Inference selector is a transient convenience — keep whatever's chosen.
+  const isel = DOM.inferenceBasetag || document.getElementById("inference-basetag");
+  if (isel) fill(isel, isel.value);
+}
+
+function selectedBasetagName() {
+  const b = STATE.basetags.find((x) => x.id === STATE.selectedBasetagId);
+  return b ? b.name : "";
+}
+
+// ↑ / ↓ on the preview page: mark the current image positive / negative for the
+// selected basetag. Mutually exclusive (sets one, clears the other); pressing
+// the same direction again clears it. Each change keeps the on-disk
+// `${base}_positive` / `${base}_negative` folder in sync via export/unexport.
+function labelCurrent(sign) {
+  const r = STATE.results[STATE.currentResultIndex];
+  if (!r) return;
+  const base = selectedBasetagName();
+  if (!base) {
+    setBasetagStatus("Pick a basetag first (create one on the Basetags page).", true);
+    return;
+  }
+
+  const posTag = `${base}_positive`;
+  const negTag = `${base}_negative`;
+  const wantTag = sign > 0 ? posTag : negTag;
+  const otherTag = sign > 0 ? negTag : posTag;
+  const item = { source: r.source, result: r.result };
+
+  if (hasTag(r, wantTag)) {
+    // Same direction again → clear this label and remove the copied files.
+    toggleTag(r, wantTag);
+    sendMessage({ type: "unexport_images", folder: wantTag, items: [item] });
+    setBasetagStatus(`Cleared “${wantTag}”.`);
+  } else {
+    // Switch sides: drop the opposite label + its copy first (mutual exclusion).
+    if (hasTag(r, otherTag)) {
+      toggleTag(r, otherTag);
+      sendMessage({ type: "unexport_images", folder: otherTag, items: [item] });
+    }
+    toggleTag(r, wantTag);
+    sendMessage({ type: "export_images", folder: wantTag, items: [item] });
+    setBasetagStatus(`Tagged “${wantTag}” → ./${wantTag}/`);
+  }
+
+  // Update the row's chips/star and counts; selection stays put (no auto-advance).
+  refreshRowTagUI(STATE.currentResultIndex);
+  updateTagCount();
+  updateTagButton();
+}
+
+function handleUnexportResult(msg) {
+  if (msg.errors && msg.errors.length) {
+    const first = msg.errors[0];
+    setBasetagStatus(
+      `Removed from ./${msg.folder} with errors: ${first.error}`,
+      true,
+    );
+  }
+  // Success is silent — labelCurrent already showed the optimistic status.
+}
+
+// ============================================================================
 // Init
 // ============================================================================
 
@@ -3717,6 +4023,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initPreviewPage();
   initProcessorsPage();
   initInferencePage();
+  initBasetagsPage();
   initFileBrowser();
 
   // Navigation

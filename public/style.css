@@ -186,6 +186,13 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 }
 .hidden-input { display: none; }
 
+/* Compact hint under the preview basetag selector. */
+.basetag-hint {
+  margin: 0.1rem 0.25rem 0.3rem;
+  font-size: 0.7rem;
+  min-height: 0;
+}
+
 /* ---- Buttons ---- */
 .btn {
   font-family: inherit;

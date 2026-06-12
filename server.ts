@@ -163,6 +163,38 @@ interface ApplyInferenceModelMessage {
   threshold: number;
 }
 
+interface Basetag {
+  id: string;
+  // The bare base name (no _positive/_negative suffix), e.g. "hands_in_the_air".
+  // Slug-safe: [A-Za-z0-9_-]. The derived tags/folders are `${name}_positive`
+  // and `${name}_negative`.
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ListBasetagsMessage {
+  type: "list_basetags";
+}
+
+interface SaveBasetagMessage {
+  type: "save_basetag";
+  basetag: { id?: string; name: string };
+}
+
+interface DeleteBasetagMessage {
+  type: "delete_basetag";
+  id: string;
+}
+
+// Inverse of export_images: remove an image (and its pose JSON) from a folder,
+// used when a positive/negative label is cleared so the folder mirrors the tags.
+interface UnexportImagesMessage {
+  type: "unexport_images";
+  folder: string;
+  items: Array<{ source: string; result: string }>;
+}
+
 type ClientMessage =
   | ScanFolderMessage
   | GetResultsMessage
@@ -180,7 +212,11 @@ type ClientMessage =
   | SaveInferenceModelMessage
   | DeleteInferenceModelMessage
   | TrainInferenceModelMessage
-  | ApplyInferenceModelMessage;
+  | ApplyInferenceModelMessage
+  | ListBasetagsMessage
+  | SaveBasetagMessage
+  | DeleteBasetagMessage
+  | UnexportImagesMessage;
 
 interface ProgressMessage {
   type: "progress";
@@ -282,6 +318,19 @@ interface ExportResultMessage {
   errors: Array<{ file: string; error: string }>;
 }
 
+interface BasetagsListMessage {
+  type: "basetags_list";
+  basetags: Basetag[];
+  error?: string;
+}
+
+interface UnexportResultMessage {
+  type: "unexport_result";
+  folder: string;
+  removed: number;
+  errors: Array<{ file: string; error: string }>;
+}
+
 interface InferenceModelsListMessage {
   type: "inference_models_list";
   models: InferenceModel[];
@@ -317,6 +366,8 @@ type ServerMessage =
   | AllPoseDataMessage
   | WriteFileResultMessage
   | ExportResultMessage
+  | BasetagsListMessage
+  | UnexportResultMessage
   | ScanLogMessage
   | InferenceModelsListMessage
   | InferenceModelTrainedMessage
@@ -1733,6 +1784,163 @@ async function handleExportImages(
   connManager.send(ws, { type: "export_result", folder, copied, failed, errors });
 }
 
+// Inverse of handleExportImages: remove the given images (and their pose JSON)
+// from a folder. Used when a positive/negative label is cleared so the basetag
+// folders stay in sync with the tags. Missing files are not errors.
+async function handleUnexportImages(
+  ws: WebSocket,
+  msg: UnexportImagesMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  const folderRaw = (msg.folder ?? "").trim();
+  // Same path-safety rules as handleExportImages: keep inside the working dir.
+  const folder = folderRaw.replace(/^\/+/, "");
+  const items = Array.isArray(msg.items) ? msg.items : [];
+
+  if (!folder || folder.includes("..")) {
+    connManager.send(ws, {
+      type: "unexport_result",
+      folder: folderRaw,
+      removed: 0,
+      errors: [{ file: "", error: `Invalid folder: "${folderRaw}"` }],
+    });
+    return;
+  }
+
+  let removed = 0;
+  const errors: Array<{ file: string; error: string }> = [];
+
+  for (const it of items) {
+    const source = it?.source ?? "";
+    const basename = source.split("/").pop() || source;
+    // Remove the image. A missing file just means it was never copied — fine.
+    try {
+      await Deno.remove(`${folder}/${basename}`);
+      removed++;
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound) && errors.length < 50) {
+        errors.push({ file: basename, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    // Remove its pose JSON alongside, if present.
+    try {
+      const resolved = it?.result ? await resolveResultPath(it.result) : null;
+      const jsonName = resolved ? resolved.split("/").pop() : null;
+      if (jsonName) await Deno.remove(`${folder}/${jsonName}`);
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound) && errors.length < 50) {
+        errors.push({ file: basename, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+
+  connManager.send(ws, { type: "unexport_result", folder, removed, errors });
+}
+
+// ---- Basetags ---------------------------------------------------------------
+// A basetag is a single base name (e.g. "hands_in_the_air"). The preview page
+// derives `${name}_positive` / `${name}_negative` tags + folders from it, and
+// the inference page auto-fills its positive/negative dirs from it.
+
+const BASETAGS_PATH = "./basetags.json";
+
+// Slug-safe name so it maps cleanly onto tag names and on-disk folder names.
+const BASETAG_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+async function loadBasetags(): Promise<Basetag[]> {
+  try {
+    const raw = await Deno.readTextFile(BASETAGS_PATH);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed as Basetag[] : [];
+  } catch {
+    return []; // first run or unreadable — start empty
+  }
+}
+
+async function saveBasetags(basetags: Basetag[]): Promise<void> {
+  await Deno.writeTextFile(
+    BASETAGS_PATH,
+    JSON.stringify(basetags, null, 2) + "\n",
+  );
+}
+
+async function handleListBasetags(
+  ws: WebSocket,
+  connManager: ConnectionManager,
+): Promise<void> {
+  try {
+    connManager.send(ws, { type: "basetags_list", basetags: await loadBasetags() });
+  } catch (e) {
+    connManager.send(ws, {
+      type: "basetags_list",
+      basetags: [],
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+async function handleSaveBasetag(
+  ws: WebSocket,
+  msg: SaveBasetagMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  try {
+    const basetags = await loadBasetags();
+    const name = (msg.basetag?.name ?? "").trim();
+    if (!BASETAG_NAME_RE.test(name)) {
+      throw new Error(
+        `Invalid basetag name "${name}". Use letters, digits, _ or - only.`,
+      );
+    }
+    // Names map to folder/tag names, so they must be unique (case-insensitive),
+    // ignoring the row being edited.
+    const clash = basetags.some((b) =>
+      b.name.toLowerCase() === name.toLowerCase() && b.id !== msg.basetag.id
+    );
+    if (clash) throw new Error(`A basetag named "${name}" already exists.`);
+
+    const now = new Date().toISOString();
+    const existing = msg.basetag.id
+      ? basetags.find((b) => b.id === msg.basetag.id)
+      : undefined;
+    if (existing) {
+      existing.name = name;
+      existing.updatedAt = now;
+    } else {
+      basetags.push({ id: crypto.randomUUID(), name, createdAt: now, updatedAt: now });
+    }
+
+    await saveBasetags(basetags);
+    connManager.send(ws, { type: "basetags_list", basetags });
+  } catch (e) {
+    connManager.send(ws, {
+      type: "basetags_list",
+      basetags: await loadBasetags().catch(() => []),
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+async function handleDeleteBasetag(
+  ws: WebSocket,
+  msg: DeleteBasetagMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  try {
+    // Note: deleting a basetag does NOT remove its on-disk _positive/_negative
+    // folders — those are user data and may already feed a trained model.
+    const basetags = (await loadBasetags()).filter((b) => b.id !== msg.id);
+    await saveBasetags(basetags);
+    connManager.send(ws, { type: "basetags_list", basetags });
+  } catch (e) {
+    connManager.send(ws, {
+      type: "basetags_list",
+      basetags: await loadBasetags().catch(() => []),
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 // ---- Inference models -------------------------------------------------------
 
 const INFERENCE_MODELS_PATH = "./inference_models.json";
@@ -2321,6 +2529,18 @@ async function handleRequest(
           break;
         case "export_images":
           await handleExportImages(socket, msg, connManager);
+          break;
+        case "unexport_images":
+          await handleUnexportImages(socket, msg, connManager);
+          break;
+        case "list_basetags":
+          await handleListBasetags(socket, connManager);
+          break;
+        case "save_basetag":
+          await handleSaveBasetag(socket, msg, connManager);
+          break;
+        case "delete_basetag":
+          await handleDeleteBasetag(socket, msg, connManager);
           break;
         case "list_inference_models":
           await handleListInferenceModels(socket, connManager);
