@@ -19,6 +19,10 @@ const STATE = {
 
   // Preview state
   results: [],           // { source, result, status, error_msg }
+  tags: {},              // result path -> [tag, …] (persisted)
+  activeTag: "marked_hands_in_the_air", // tag that "m"/★ toggles (persisted)
+  exportFolder: "filtered_images", // destination for the Export action (persisted)
+  exporting: false,      // true while an export_images request is in flight
   currentResultIndex: -1,
   currentPoseData: null,
   currentImage: null,    // HTMLImageElement
@@ -37,6 +41,12 @@ const STATE = {
   filteredOut: {},         // result path -> reason string (image hidden in preview)
   showFiltered: false,     // when true, filtered images stay visible (dimmed)
   showFailed: false,       // when true, images whose inference failed stay visible
+  invertFilter: false,     // when true, keep images that DON'T match the processors
+  limitCount: 0,           // cap the kept set to this many images (0 = no limit)
+  limitFilteredOut: {},    // result path -> reason for images hidden by the limit
+  procResult: null,        // { matched:Set, reasons:{}, evaluated:[] } from the last run
+  procCache: {},           // procId -> { version, sig, matched:[rp…] } (persisted)
+  modelCache: {},          // modelId -> { version, sig, prob:{rp:number} } (persisted)
   runningProcessors: false,
   monacoEditor: null,
   monacoLoading: null,     // Promise while Monaco is loading
@@ -51,6 +61,13 @@ const STATE = {
   applyingInference: false,    // true while an apply_inference_model request is in flight
   dirBrowseTarget: null,       // input id the inline folder browser writes back to
   dirBrowsePath: "/",          // current path of the inline folder browser
+
+  // Processor GUI (lil-gui). Controls are rebuilt each run, but their VALUES
+  // persist here so a processor can read user-entered settings across runs.
+  gui: null,                   // active lil-gui GUI instance (mounted in preview)
+  guiControllers: {},          // control label -> lil-gui controller (this run)
+  guiValues: {},               // control label -> current value (persistent)
+  lilGuiLoading: null,         // Promise while lil-gui is loading from the CDN
 };
 
 // ---- DOM refs (cached after DOMContentLoaded) --------------------------------
@@ -277,6 +294,171 @@ function makeImageHelpers(o_img, pose) {
   return { f_save_image, f_save_json, f_save_filtered };
 }
 
+// ---- Processor GUI (lil-gui) ------------------------------------------------
+//
+// Processors can render persistent controls on the preview page with
+// f_gui(label, default), which returns the control's current value. The raw
+// lil-gui namespace is also injected as `lil_gui` for advanced use
+// (new lil_gui.GUI(...)). Controls are rebuilt at the start of each run so only
+// the ones used by the current pipeline show, but their VALUES persist in
+// STATE.guiValues across images and runs — letting a processor read a setting
+// (e.g. a destination folder) the user typed earlier.
+
+const LIL_GUI_URL =
+  "https://cdn.jsdelivr.net/npm/lil-gui@0.20/dist/lil-gui.umd.min.js";
+
+// Load lil-gui from the CDN once. Resolves with the lil namespace, or null if
+// it can't load (offline) — processors then just fall back to default values.
+function ensureLilGui() {
+  if (window.lil && window.lil.GUI) return Promise.resolve(window.lil);
+  if (STATE.lilGuiLoading) return STATE.lilGuiLoading;
+  STATE.lilGuiLoading = new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = LIL_GUI_URL;
+    s.onload = () => resolve(window.lil || null);
+    s.onerror = () => {
+      console.warn("lil-gui failed to load — processors will use default values.");
+      resolve(null);
+    };
+    document.head.appendChild(s);
+  });
+  return STATE.lilGuiLoading;
+}
+
+// Tear down and recreate the shared GUI panel. Called once at the start of a
+// run / refresh; f_gui() re-adds each control as it's first referenced, reusing
+// the persisted value. The host stays hidden until a control is actually added.
+// Prefers a lil-gui panel; falls back to native inputs if lil-gui isn't loaded
+// (offline / CDN blocked) so the fields ALWAYS appear.
+function rebuildProcessorGui() {
+  const host = DOM.processorGuiHost;
+  if (!host) return;
+  host.innerHTML = "";
+  if (STATE.gui) {
+    try { STATE.gui.destroy(); } catch { /* already gone */ }
+  }
+  STATE.gui = null;
+  STATE.guiControllers = {};
+  host.classList.add("hidden");
+
+  if (window.lil && window.lil.GUI) {
+    try {
+      STATE.gui = new window.lil.GUI({ container: host, title: "Processor controls" });
+    } catch {
+      STATE.gui = null;
+    }
+  }
+  if (!STATE.gui) {
+    // Native fallback: a titled container; f_gui() appends plain input rows.
+    const title = document.createElement("div");
+    title.className = "pg-title";
+    title.textContent = "Processor controls";
+    host.appendChild(title);
+  }
+}
+
+// Append a native (non-lil-gui) control row to the host and bind it to
+// STATE.guiValues[key]. Type follows the value's type.
+function addNativeControl(key, value) {
+  const host = DOM.processorGuiHost;
+  const row = document.createElement("label");
+  row.className = "pg-row";
+  const span = document.createElement("span");
+  span.className = "pg-label";
+  span.textContent = key;
+  span.title = key;
+  const input = document.createElement("input");
+  input.className = "pg-input";
+  if (typeof value === "boolean") {
+    input.type = "checkbox";
+    input.checked = !!value;
+    input.addEventListener("change", () => { STATE.guiValues[key] = input.checked; });
+  } else if (typeof value === "number") {
+    input.type = "number";
+    input.value = String(value);
+    input.addEventListener("input", () => {
+      const n = parseFloat(input.value);
+      STATE.guiValues[key] = Number.isNaN(n) ? 0 : n;
+    });
+  } else {
+    input.type = "text";
+    input.value = String(value);
+    input.addEventListener("input", () => { STATE.guiValues[key] = input.value; });
+  }
+  row.appendChild(span);
+  row.appendChild(input);
+  host.appendChild(row);
+  return row;
+}
+
+// Injected into processors as `f_gui`. Returns the current value of a
+// persistent control labelled `label`, creating it (bound to STATE.guiValues)
+// on first reference this run. The control type follows the default's type
+// (string -> text, number -> number, boolean -> checkbox).
+function f_gui(label, def) {
+  const key = String(label);
+  if (!(key in STATE.guiValues)) STATE.guiValues[key] = def;
+  if (!STATE.guiControllers[key]) {
+    if (STATE.gui) {
+      try {
+        STATE.guiControllers[key] = STATE.gui.add(STATE.guiValues, key);
+      } catch { /* unsupported type — value still returned, just no control */ }
+    } else if (DOM.processorGuiHost) {
+      STATE.guiControllers[key] = addNativeControl(key, STATE.guiValues[key]);
+    }
+    if (STATE.guiControllers[key] && DOM.processorGuiHost) {
+      DOM.processorGuiHost.classList.remove("hidden");
+    }
+  }
+  return STATE.guiValues[key];
+}
+
+// Populate the Pipeline's "Processor controls" panel from the currently ACTIVE
+// processors WITHOUT a full run, so f_gui() inputs (e.g. a filter's threshold or
+// min-people value) appear as soon as a processor is active — letting the user
+// set values before running. Each active processor is executed once against a placeholder
+// image with inert side-effect helpers, purely to register its controls; any
+// error (or a processor that only calls f_gui inside an image-dependent branch)
+// is ignored. A real run re-registers with live values afterwards.
+async function refreshProcessorGui() {
+  if (STATE.runningProcessors) return; // don't disturb the GUI mid-run
+  await ensureLilGui();
+  rebuildProcessorGui();
+
+  const active = (STATE.processors || []).filter((p) => p.active);
+  if (active.length === 0) return;
+
+  const o_img = {
+    s_path_abs: "", s_name_file: "", s_msg_error: "",
+    n_scl_x: 0, n_scl_y: 0, n_persons: 0, a_s_tag: [],
+    a_o_person: [],
+  };
+  // Inert helpers: a probe must never touch the filesystem. They return a
+  // pending promise so processors that chain .then(...) produce no side effects.
+  const inert = () => new Promise(() => {});
+  const probeArgs = [o_img, inert, inert, inert, inert, window.lil || null, f_gui];
+
+  // Silence console during the dry pass so processors' own log lines don't spam
+  // devtools on every navigate/toggle. Restored immediately after (the probe is
+  // synchronous and the inert helpers never resolve, so nothing logs later).
+  const saved = { log: console.log, warn: console.warn, error: console.error };
+  console.log = console.warn = console.error = () => {};
+  try {
+    for (const p of active) {
+      try {
+        const fn = new Function(...PROCESSOR_ARG_NAMES, p.code);
+        fn(...probeArgs);
+      } catch {
+        // Best-effort control registration — ignore processor errors here.
+      }
+    }
+  } finally {
+    console.log = saved.log;
+    console.warn = saved.warn;
+    console.error = saved.error;
+  }
+}
+
 // Argument names (and order) injected into every processor function. Keep the
 // compile sites and the call site in sync via this single list.
 const PROCESSOR_ARG_NAMES = [
@@ -285,12 +467,22 @@ const PROCESSOR_ARG_NAMES = [
   "f_save_image",
   "f_save_json",
   "f_save_filtered",
+  "lil_gui",
+  "f_gui",
 ];
 
 // Produce the concrete argument values for a processor call on one image.
 function processorArgs(o_img, pose) {
   const h = makeImageHelpers(o_img, pose);
-  return [o_img, f_deno_write_file, h.f_save_image, h.f_save_json, h.f_save_filtered];
+  return [
+    o_img,
+    f_deno_write_file,
+    h.f_save_image,
+    h.f_save_json,
+    h.f_save_filtered,
+    window.lil || null,
+    f_gui,
+  ];
 }
 
 function updateConnectionIndicator(connected) {
@@ -343,6 +535,9 @@ function handleMessage(msg) {
       break;
     case "write_file_result":
       handleWriteFileResult(msg);
+      break;
+    case "export_result":
+      handleExportResult(msg);
       break;
     case "scan_log":
       handleScanLog(msg);
@@ -414,6 +609,8 @@ function handleResultsList(msg) {
   // state; the user re-runs processors / re-applies a model explicitly.
   STATE.filteredOut = {};
   STATE.inferenceFilteredOut = {};
+  STATE.limitFilteredOut = {};
+  STATE.procResult = null; // last run no longer applies to this result set
   STATE.appliedInferenceId = null;
   if (DOM.btnClearInference) DOM.btnClearInference.classList.add("hidden");
   setInferenceFilterStatus("");
@@ -439,7 +636,7 @@ function handleResultsList(msg) {
       JSON.stringify(STATE.results[0]),
     );
   }
-  renderImageList();
+  applyAllFilters();
 }
 
 function handlePoseData(msg) {
@@ -470,20 +667,57 @@ function initLogPage() {
   DOM.logStatus = document.getElementById("log-status");
   DOM.logAutoscroll = document.getElementById("chk-log-autoscroll");
   DOM.btnClearLog = document.getElementById("btn-clear-log");
+  DOM.logOverlay = document.getElementById("log-overlay");
+  DOM.btnToggleLog = document.getElementById("btn-toggle-log");
+  DOM.btnCloseLog = document.getElementById("btn-close-log");
 
   if (DOM.btnClearLog) DOM.btnClearLog.addEventListener("click", clearLog);
+  if (DOM.btnToggleLog) DOM.btnToggleLog.addEventListener("click", toggleLogOverlay);
+  if (DOM.btnCloseLog) DOM.btnCloseLog.addEventListener("click", hideLogOverlay);
+  // Esc closes the overlay.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isLogOverlayOpen()) hideLogOverlay();
+  });
+}
+
+// ---- Live Log overlay (toggled from the header, visible on any page) --------
+
+function isLogOverlayOpen() {
+  return !!(DOM.logOverlay && !DOM.logOverlay.classList.contains("hidden"));
+}
+
+function showLogOverlay() {
+  if (!DOM.logOverlay) return;
+  DOM.logOverlay.classList.remove("hidden");
+  if (DOM.btnToggleLog) DOM.btnToggleLog.classList.add("active");
+  if (DOM.liveLog && (!DOM.logAutoscroll || DOM.logAutoscroll.checked)) {
+    DOM.liveLog.scrollTop = DOM.liveLog.scrollHeight;
+  }
+}
+
+function hideLogOverlay() {
+  if (!DOM.logOverlay) return;
+  DOM.logOverlay.classList.add("hidden");
+  if (DOM.btnToggleLog) DOM.btnToggleLog.classList.remove("active");
+}
+
+function toggleLogOverlay() {
+  if (isLogOverlayOpen()) hideLogOverlay();
+  else showLogOverlay();
 }
 
 function setLogStatus(state) {
   // state: "running" | "idle"
-  if (!DOM.logStatus) return;
-  const running = state === "running";
-  DOM.logStatus.textContent = running ? "● Scan running" : "Idle";
-  DOM.logStatus.classList.toggle("running", running);
-  DOM.logStatus.classList.toggle("idle", !running);
-  // Pulse the nav tab while a scan is live so the activity is visible from any page.
-  const tab = document.getElementById("nav-log");
-  if (tab) tab.classList.toggle("live", running);
+  if (DOM.logStatus) {
+    const running = state === "running";
+    DOM.logStatus.textContent = running ? "● Scan running" : "Idle";
+    DOM.logStatus.classList.toggle("running", running);
+    DOM.logStatus.classList.toggle("idle", !running);
+  }
+  // Pulse the header toggle while a scan is live so activity shows from any page.
+  if (DOM.btnToggleLog) {
+    DOM.btnToggleLog.classList.toggle("live", state === "running");
+  }
 }
 
 function clearLog() {
@@ -585,6 +819,9 @@ function navigateTo(page) {
     loadResults();
     sendMessage({ type: "list_processors" });
     sendMessage({ type: "list_inference_models" });
+    // Show processor input fields right away from the cached processor list;
+    // the list_processors response refreshes them again when it arrives.
+    refreshProcessorGui();
   }
 
   // Load processors and bootstrap Monaco when entering the processors page
@@ -665,10 +902,10 @@ function startScan() {
     return;
   }
 
-  // Surface live server activity: mark the log running and jump to it so the
-  // user sees what's happening during the (potentially long) scan.
+  // Surface live server activity: mark the log running and open the overlay so
+  // the user sees what's happening during the (potentially long) scan.
   setLogStatus("running");
-  navigateTo("log");
+  showLogOverlay();
 }
 
 function cancelScan() {
@@ -762,12 +999,14 @@ function updateFileLogEntry(msg) {
 function initPreviewPage() {
   DOM.imageList = document.getElementById("image-list");
   DOM.imageCount = document.getElementById("image-count");
+  DOM.markedCount = document.getElementById("marked-count");
   DOM.btnRunProcessors = document.getElementById("btn-run-processors");
   DOM.chkShowFiltered = document.getElementById("chk-show-filtered");
   DOM.chkShowFailed = document.getElementById("chk-show-failed");
   DOM.processorFilterStatus = document.getElementById("processor-filter-status");
   DOM.processorOrderList = document.getElementById("processor-order-list");
   DOM.processorOrderCount = document.getElementById("processor-order-count");
+  DOM.processorGuiHost = document.getElementById("processor-gui-host");
   DOM.viewerPlaceholder = document.getElementById("viewer-placeholder");
   DOM.canvasContainer = document.getElementById("canvas-container");
   DOM.poseCanvas = document.getElementById("pose-canvas");
@@ -778,6 +1017,7 @@ function initPreviewPage() {
   DOM.btnToggleLabels = document.getElementById("btn-toggle-labels");
   DOM.btnToggleInfo = document.getElementById("btn-toggle-info");
   DOM.btnToggleKeypoints = document.getElementById("btn-toggle-keypoints");
+  DOM.btnToggleMark = document.getElementById("btn-toggle-mark");
   DOM.btnResetView = document.getElementById("btn-reset-view");
   DOM.infoOverlay = document.getElementById("info-overlay");
   DOM.infoOverlayBody = document.getElementById("info-overlay-body");
@@ -791,6 +1031,20 @@ function initPreviewPage() {
   DOM.btnToggleLabels.addEventListener("click", toggleLabels);
   DOM.btnToggleInfo.addEventListener("click", toggleInfo);
   DOM.btnToggleKeypoints.addEventListener("click", toggleKeypoints);
+  if (DOM.btnToggleMark) DOM.btnToggleMark.addEventListener("click", toggleActiveTagOnCurrent);
+
+  // Active-tag input: what "m" / the ★ toggles. Re-render so row stars/chips and
+  // the count reflect the newly-active tag.
+  DOM.activeTag = document.getElementById("active-tag");
+  if (DOM.activeTag) {
+    DOM.activeTag.value = STATE.activeTag || "";
+    DOM.activeTag.addEventListener("input", () => {
+      STATE.activeTag = DOM.activeTag.value;
+      saveState();
+      renderImageList();
+      updateTagButton();
+    });
+  }
   DOM.btnResetView.addEventListener("click", resetView);
   initCanvasZoomPan();
   DOM.opacitySlider.addEventListener("input", () => {
@@ -802,6 +1056,19 @@ function initPreviewPage() {
   DOM.btnPrevImage.addEventListener("click", () => navigateImages(-1));
   DOM.btnNextImage.addEventListener("click", () => navigateImages(1));
 
+  // Export action (copies the kept set to a folder, server-side)
+  DOM.exportFolder = document.getElementById("export-folder");
+  DOM.btnExportImages = document.getElementById("btn-export-images");
+  DOM.exportStatus = document.getElementById("export-status");
+  if (DOM.exportFolder && STATE.exportFolder) DOM.exportFolder.value = STATE.exportFolder;
+  if (DOM.btnExportImages) DOM.btnExportImages.addEventListener("click", exportImages);
+  if (DOM.exportFolder) {
+    DOM.exportFolder.addEventListener("input", () => {
+      STATE.exportFolder = DOM.exportFolder.value;
+      saveState();
+    });
+  }
+
   // Processor run + filter visibility
   DOM.btnRunProcessors.addEventListener("click", runProcessors);
   DOM.chkShowFiltered.addEventListener("change", () => {
@@ -812,6 +1079,27 @@ function initPreviewPage() {
     STATE.showFailed = DOM.chkShowFailed.checked;
     renderImageList();
   });
+
+  // Invert + limit — re-derive the filter instantly, no re-run needed.
+  DOM.chkInvertFilter = document.getElementById("chk-invert-filter");
+  DOM.limitCount = document.getElementById("limit-count");
+  if (DOM.chkInvertFilter) {
+    DOM.chkInvertFilter.checked = !!STATE.invertFilter;
+    DOM.chkInvertFilter.addEventListener("change", () => {
+      STATE.invertFilter = DOM.chkInvertFilter.checked;
+      saveState();
+      applyAllFilters();
+    });
+  }
+  if (DOM.limitCount) {
+    DOM.limitCount.value = String(STATE.limitCount || 0);
+    DOM.limitCount.addEventListener("input", () => {
+      const n = parseInt(DOM.limitCount.value, 10);
+      STATE.limitCount = Number.isNaN(n) || n < 0 ? 0 : n;
+      saveState();
+      applyAllFilters();
+    });
+  }
 
   // Inference-model filter column (preview sidebar)
   DOM.inferenceModelChoices = document.getElementById("inference-model-choices");
@@ -858,17 +1146,291 @@ function loadResults() {
 
 function isFilteredOut(result) {
   return Object.prototype.hasOwnProperty.call(STATE.filteredOut, result.result) ||
-    Object.prototype.hasOwnProperty.call(STATE.inferenceFilteredOut, result.result);
+    Object.prototype.hasOwnProperty.call(STATE.inferenceFilteredOut, result.result) ||
+    Object.prototype.hasOwnProperty.call(STATE.limitFilteredOut, result.result);
 }
 
-// Reason an image is hidden by a processor or applied inference model (or "").
+// Reason an image is hidden by a processor, applied model, or the limit (or "").
 function filterReason(result) {
   return STATE.filteredOut[result.result] ||
-    STATE.inferenceFilteredOut[result.result] || "";
+    STATE.inferenceFilteredOut[result.result] ||
+    STATE.limitFilteredOut[result.result] || "";
 }
 
 function isFailed(result) {
   return result.status !== "ok";
+}
+
+// ---- Derived processor / invert / limit filtering ---------------------------
+//
+// The processor run records which images "matched" (passed every active
+// processor); the visible filter is DERIVED from that so the Invert and Limit
+// controls re-apply instantly without re-running the pipeline.
+
+// Rebuild STATE.filteredOut (the processor filter) from the last run + invert.
+function recomputeProcessorFilter() {
+  const res = STATE.procResult;
+  if (!res) { STATE.filteredOut = {}; return; }
+  const filtered = {};
+  for (const rp of res.evaluated) {
+    const matched = res.matched.has(rp);
+    const hide = STATE.invertFilter ? matched : !matched;
+    if (hide) {
+      filtered[rp] = STATE.invertFilter
+        ? "Matched (inverted filter)"
+        : (res.reasons[rp] || "Filtered by processors");
+    }
+  }
+  STATE.filteredOut = filtered;
+}
+
+// Cap the kept set (passed processor + inference filters, not failed) to
+// STATE.limitCount, hiding the overflow. 0 = no limit.
+function recomputeLimit() {
+  const over = {};
+  const limit = STATE.limitCount | 0;
+  if (limit > 0) {
+    let kept = 0;
+    for (const r of STATE.results) {
+      if (isFailed(r)) continue;
+      if (
+        Object.prototype.hasOwnProperty.call(STATE.filteredOut, r.result) ||
+        Object.prototype.hasOwnProperty.call(STATE.inferenceFilteredOut, r.result)
+      ) continue;
+      kept++;
+      if (kept > limit) over[r.result] = `Over limit (${limit})`;
+    }
+  }
+  STATE.limitFilteredOut = over;
+}
+
+// Recompute every derived filter and repaint the list.
+function applyAllFilters() {
+  recomputeProcessorFilter();
+  recomputeLimit();
+  renderImageList();
+}
+
+// ---- Tagging ----------------------------------------------------------------
+//
+// Each image can carry multiple string tags (e.g. "marked_hands_in_the_air").
+// The "Active tag" box names the tag that "m" / the row ★ toggles on/off, so the
+// user can curate several independent sets. Tags are keyed by result path and
+// persisted in localStorage (result paths are stable across reloads/re-scans),
+// and surfaced to processors as o_img.a_s_tag (see the has_tag processor).
+
+const TAGS_KEY = "pilotless_poses_tags";
+const MARKS_KEY = "pilotless_poses_marks"; // legacy boolean marks (migrated once)
+
+function loadTags() {
+  try {
+    const raw = localStorage.getItem(TAGS_KEY);
+    STATE.tags = raw ? (JSON.parse(raw) || {}) : {};
+  } catch {
+    STATE.tags = {};
+  }
+  // One-time migration from the old boolean marks → a "marked" tag.
+  if (Object.keys(STATE.tags).length === 0) {
+    try {
+      const old = JSON.parse(localStorage.getItem(MARKS_KEY) || "null");
+      if (old && typeof old === "object") {
+        for (const key of Object.keys(old)) {
+          if (old[key]) STATE.tags[key] = ["marked"];
+        }
+        if (Object.keys(STATE.tags).length) saveTags();
+      }
+    } catch { /* no legacy marks */ }
+  }
+}
+
+function saveTags() {
+  try {
+    localStorage.setItem(TAGS_KEY, JSON.stringify(STATE.tags));
+  } catch { /* storage full / unavailable — tags stay in-memory only */ }
+}
+
+function tagsFor(result) {
+  return (result && STATE.tags[result.result]) || [];
+}
+
+function hasTag(result, tag) {
+  return !!tag && tagsFor(result).includes(tag);
+}
+
+// Add/remove `tag` on an image; cleans up empty arrays so untagged images leave
+// no entry behind.
+function toggleTag(result, tag) {
+  if (!result || !tag) return;
+  const list = STATE.tags[result.result] ? [...STATE.tags[result.result]] : [];
+  const i = list.indexOf(tag);
+  if (i === -1) list.push(tag);
+  else list.splice(i, 1);
+  if (list.length) STATE.tags[result.result] = list;
+  else delete STATE.tags[result.result];
+  saveTags();
+}
+
+// The tag named in the "Active tag" box (what "m" / the ★ toggles).
+function activeTag() {
+  return (DOM.activeTag?.value ?? STATE.activeTag ?? "").trim();
+}
+
+// Toggle the active tag on the currently-viewed image (toolbar button + "m").
+function toggleActiveTagOnCurrent() {
+  const tag = activeTag();
+  const r = STATE.results[STATE.currentResultIndex];
+  if (!r) return;
+  if (!tag) {
+    setExportStatus("Type a tag in the “Active tag” box first.", true);
+    return;
+  }
+  toggleTag(r, tag);
+  refreshRowTagUI(STATE.currentResultIndex);
+  updateTagButton();
+  updateTagCount();
+}
+
+function paintStar(el, on) {
+  el.classList.toggle("marked", on);
+  el.textContent = on ? "★" : "☆";
+  el.title = on
+    ? `Tagged “${activeTag()}” — click to remove (m)`
+    : `Tag “${activeTag() || "…"}” (m)`;
+}
+
+// Reflect whether the current image carries the active tag on the toolbar button.
+function updateTagButton() {
+  const btn = DOM.btnToggleMark;
+  if (!btn) return;
+  const r = STATE.results[STATE.currentResultIndex];
+  const tag = activeTag();
+  btn.disabled = !r || !tag;
+  const on = hasTag(r, tag);
+  btn.classList.toggle("btn-active", on);
+  btn.textContent = on ? "★ Tagged" : "☆ Tag";
+  btn.title = tag
+    ? `Toggle tag “${tag}” on this image (M)`
+    : "Set an Active tag in the sidebar first";
+}
+
+// Show how many of the CURRENT results carry the active tag.
+function updateTagCount() {
+  const el = DOM.markedCount;
+  if (!el) return;
+  const tag = activeTag();
+  const n = tag ? STATE.results.filter((r) => hasTag(r, tag)).length : 0;
+  el.textContent = `🏷 ${n}`;
+  el.title = tag ? `${n} image(s) tagged “${tag}”` : "Tagged images";
+  el.classList.toggle("hidden", n === 0);
+}
+
+// Build the chip row for an image's tags (the active tag highlighted).
+function buildChips(tags) {
+  const chips = document.createElement("span");
+  chips.className = "tag-chips";
+  const cur = activeTag();
+  for (const t of tags) {
+    const chip = document.createElement("span");
+    chip.className = "tag-chip" + (t === cur ? " active" : "");
+    chip.textContent = t;
+    chip.title = t;
+    chips.appendChild(chip);
+  }
+  return chips;
+}
+
+// Update one image row's star + tag chips in place (no full re-render, so the
+// list doesn't jump-scroll when you toggle a tag mid-list).
+function refreshRowTagUI(index) {
+  const r = STATE.results[index];
+  const div = document.querySelector(`.image-item[data-index="${index}"]`);
+  if (!r || !div) return;
+  const star = div.querySelector(".mark-star");
+  const on = hasTag(r, activeTag());
+  if (star) paintStar(star, on);
+  div.classList.toggle("marked", on);
+  const info = div.querySelector(".info");
+  if (info) {
+    const old = info.querySelector(".tag-chips");
+    if (old) old.remove();
+    const tags = tagsFor(r);
+    if (tags.length) info.appendChild(buildChips(tags));
+  }
+}
+
+// ---- Export -----------------------------------------------------------------
+//
+// A first-class action (not a processor): copy the images that passed the
+// active filters/marks — and their pose JSON — into a folder. The server does
+// the copy with Deno.copyFile and reports a summary. The "what" is whatever the
+// filters kept; Export just decides "where" and "when".
+
+// Images that survived the active filters: not failed, not filtered out. This
+// ignores the "show filtered/failed" view toggles — those only affect what's
+// visible, not what counts as kept.
+function keptResults() {
+  return STATE.results.filter((r) => !isFailed(r) && !isFilteredOut(r));
+}
+
+function updateExportButton() {
+  const btn = DOM.btnExportImages;
+  if (!btn) return;
+  if (STATE.exporting) return; // leave the "Exporting…" label alone
+  const n = keptResults().length;
+  btn.textContent = n > 0 ? `Export ${n}` : "Export";
+  btn.disabled = n === 0;
+}
+
+function exportImages() {
+  if (STATE.exporting) return;
+  const folder = (DOM.exportFolder?.value || "").trim();
+  if (!folder) {
+    setExportStatus("Enter a folder name first.", true);
+    return;
+  }
+  const kept = keptResults();
+  if (kept.length === 0) {
+    setExportStatus("Nothing to export — no images passed the filters.", true);
+    return;
+  }
+
+  const items = kept.map((r) => ({ source: r.source, result: r.result }));
+  const sent = sendMessage({ type: "export_images", folder, items });
+  if (!sent) {
+    setExportStatus("Not connected — could not export.", true);
+    return;
+  }
+
+  STATE.exporting = true;
+  STATE.exportFolder = folder;
+  saveState();
+  if (DOM.btnExportImages) {
+    DOM.btnExportImages.disabled = true;
+    DOM.btnExportImages.textContent = "Exporting…";
+  }
+  setExportStatus(`Exporting ${items.length} image(s) to ./${folder}…`);
+}
+
+function handleExportResult(msg) {
+  STATE.exporting = false;
+  updateExportButton();
+  if (msg.failed > 0) {
+    const first = (msg.errors && msg.errors[0]) || null;
+    const detail = first ? ` First error (${first.file}): ${first.error}` : "";
+    setExportStatus(
+      `Exported ${msg.copied} to ./${msg.folder}, ${msg.failed} failed.${detail}`,
+      true,
+    );
+  } else {
+    setExportStatus(`Exported ${msg.copied} image(s) to ./${msg.folder}.`);
+  }
+}
+
+function setExportStatus(text, highlight) {
+  const el = DOM.exportStatus;
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("has-filter", !!highlight);
 }
 
 // The images currently shown in the sidebar, in order. Navigation (arrow keys
@@ -913,6 +1475,8 @@ function renderImageList() {
 
   DOM.imageCount.textContent = String(visible.length);
   updateFilterStatus();
+  updateTagCount();
+  updateExportButton();
 
   if (visible.length === 0) {
     DOM.imageList.innerHTML =
@@ -958,6 +1522,10 @@ function renderImageList() {
     info.appendChild(nameEl);
     info.appendChild(statusEl);
 
+    // Tag chips — show every tag this image carries (the active one highlighted).
+    const rowTags = tagsFor(r);
+    if (rowTags.length) info.appendChild(buildChips(rowTags));
+
     if (isFilteredOut(r)) {
       const tag = document.createElement("span");
       tag.className = "filter-tag";
@@ -974,6 +1542,24 @@ function renderImageList() {
       div.appendChild(info);
       div.appendChild(dot);
     }
+
+    // ★ toggles the ACTIVE tag on this image (doesn't select the image).
+    const star = document.createElement("button");
+    star.className = "mark-star";
+    paintStar(star, hasTag(r, activeTag()));
+    star.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!activeTag()) {
+        setExportStatus("Type a tag in the “Active tag” box first.", true);
+        return;
+      }
+      toggleTag(r, activeTag());
+      refreshRowTagUI(idx);
+      if (STATE.results[STATE.currentResultIndex] === r) updateTagButton();
+      updateTagCount();
+    });
+    div.classList.toggle("marked", hasTag(r, activeTag()));
+    div.appendChild(star);
 
     div.addEventListener("click", () => selectImage(idx));
 
@@ -1021,6 +1607,9 @@ function selectImage(index) {
   document.querySelectorAll(".image-item").forEach((el) => el.classList.remove("active"));
   const item = document.querySelector(`.image-item[data-index="${index}"]`);
   if (item) item.classList.add("active");
+
+  // Reflect this image's active-tag state on the toolbar button.
+  updateTagButton();
 
   // Update nav display — show position within the visible (shown) images, not
   // the full result set, so it matches what the arrows actually step through.
@@ -1481,6 +2070,10 @@ function handleKeyboard(e) {
       e.preventDefault();
       toggleKeypoints();
       break;
+    case "m":
+      e.preventDefault();
+      toggleActiveTagOnCurrent();
+      break;
     case "0":
       e.preventDefault();
       resetView();
@@ -1627,6 +2220,13 @@ function handleProcessorsList(msg) {
   renderProcessorList();
   renderProcessorOrder();
 
+  // Keep the Pipeline's "Processor controls" panel in sync with the active set
+  // so f_gui() inputs appear/disappear immediately as processors are toggled,
+  // reordered, or edited — without needing a run first.
+  if (document.getElementById("page-preview")?.classList.contains("active")) {
+    refreshProcessorGui();
+  }
+
   // If we were editing a processor that no longer exists, close the editor.
   if (
     STATE.editingProcessorId &&
@@ -1678,7 +2278,7 @@ function renderProcessorList() {
   });
 }
 
-// ---- Pipeline column (active processors, reorderable) on the preview page ----
+// ---- Pipeline column (ALL processors, toggle + reorderable) on the preview ----
 
 let dragProcId = null;
 
@@ -1686,20 +2286,22 @@ function renderProcessorOrder() {
   const list = DOM.processorOrderList;
   if (!list) return;
 
-  const active = STATE.processors.filter((p) => p.active);
+  const all = STATE.processors;
+  const activeCount = all.filter((p) => p.active).length;
   if (DOM.processorOrderCount) {
-    DOM.processorOrderCount.textContent = String(active.length);
+    DOM.processorOrderCount.textContent = String(activeCount);
   }
 
   list.innerHTML = "";
-  if (active.length === 0) {
-    list.innerHTML = '<div class="placeholder">No active processors.</div>';
+  if (all.length === 0) {
+    list.innerHTML = '<div class="placeholder">No processors yet.</div>';
     return;
   }
 
-  active.forEach((p, i) => {
+  let activeIdx = 0;
+  all.forEach((p) => {
     const div = document.createElement("div");
-    div.className = "processor-order-entry";
+    div.className = "processor-order-entry" + (p.active ? "" : " inactive");
     div.draggable = true;
     div.dataset.id = p.id;
 
@@ -1708,16 +2310,27 @@ function renderProcessorOrder() {
     handle.textContent = "⠿";
     handle.title = "Drag to reorder";
 
+    // Order number among ACTIVE processors (inactive show a dash).
     const num = document.createElement("span");
     num.className = "po-num";
-    num.textContent = String(i + 1);
+    num.textContent = p.active ? String(++activeIdx) : "–";
+
+    // Quick enable/disable toggle right in the pipeline.
+    const toggle = document.createElement("button");
+    toggle.className = `p-toggle ${p.active ? "on" : ""}`;
+    toggle.textContent = p.active ? "On" : "Off";
+    toggle.title = p.active ? "Disable this processor" : "Enable this processor";
+    toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleProcessorActive(p);
+    });
 
     const name = document.createElement("span");
     name.className = "po-name";
     name.textContent = p.name || "(unnamed)";
     name.title = p.name || "";
 
-    div.append(handle, num, name);
+    div.append(handle, num, toggle, name);
 
     div.addEventListener("dragstart", (e) => {
       dragProcId = p.id;
@@ -1747,7 +2360,7 @@ function renderProcessorOrder() {
       e.preventDefault();
       div.classList.remove("drop-before", "drop-after");
       if (!dragProcId || dragProcId === p.id) return;
-      reorderActiveProcessors(dragProcId, p.id, isPointerInLowerHalf(e, div));
+      reorderProcessors(dragProcId, p.id, isPointerInLowerHalf(e, div));
     });
 
     list.appendChild(div);
@@ -1759,33 +2372,26 @@ function isPointerInLowerHalf(event, el) {
   return event.clientY > rect.top + rect.height / 2;
 }
 
-// Move `draggedId` next to `targetId` among the active processors, then rebuild
-// STATE.processors so inactive entries keep their slots. Persists the new order
-// to the server and re-applies the pipeline if a run already produced results.
-function reorderActiveProcessors(draggedId, targetId, placeAfter) {
-  const activeIds = STATE.processors.filter((p) => p.active).map((p) => p.id);
-  const from = activeIds.indexOf(draggedId);
+// Move `draggedId` next to `targetId` in the full processor list (active and
+// inactive alike). The active application order is just this list filtered to
+// active. Persists the order and re-applies the pipeline if a run already ran.
+function reorderProcessors(draggedId, targetId, placeAfter) {
+  const ids = STATE.processors.map((p) => p.id);
+  const from = ids.indexOf(draggedId);
   if (from === -1) return;
-  activeIds.splice(from, 1);
+  ids.splice(from, 1);
 
-  let to = activeIds.indexOf(targetId);
-  if (to === -1) to = activeIds.length;
+  let to = ids.indexOf(targetId);
+  if (to === -1) to = ids.length;
   else if (placeAfter) to += 1;
-  activeIds.splice(to, 0, draggedId);
+  ids.splice(to, 0, draggedId);
 
-  // Fill the active slots in the new order; leave inactive entries in place.
   const byId = Object.fromEntries(STATE.processors.map((p) => [p.id, p]));
-  let ai = 0;
-  STATE.processors = STATE.processors.map((p) =>
-    p.active ? byId[activeIds[ai++]] : p
-  );
+  STATE.processors = ids.map((id) => byId[id]);
 
   renderProcessorOrder();
   renderProcessorList();
-  sendMessage({
-    type: "reorder_processors",
-    order: STATE.processors.map((p) => p.id),
-  });
+  sendMessage({ type: "reorder_processors", order: ids });
 
   // Reflect the new order immediately if processors were already run.
   if (STATE.results.length > 0) runProcessors();
@@ -2048,12 +2654,84 @@ function buildPersonObject(person) {
   };
 }
 
+// ---- Result cache (versioned) ----------------------------------------------
+//
+// Running a processor or applying a model over every image is expensive, and we
+// re-do it constantly during curation. So we cache each processor's matched set
+// and each model's per-image scores, keyed by the processor/model VERSION (from
+// the server) and a signature of the current image set. A cache entry is valid
+// only while both match — editing a processor (version bump), retraining a model
+// (version bump), or scanning a different folder (signature change) invalidates
+// it automatically and forces a fresh run.
+
+const PROC_CACHE_KEY = "pilotless_poses_proc_cache";
+const MODEL_CACHE_KEY = "pilotless_poses_model_cache";
+
+function loadCaches() {
+  try { STATE.procCache = JSON.parse(localStorage.getItem(PROC_CACHE_KEY)) || {}; }
+  catch { STATE.procCache = {}; }
+  try { STATE.modelCache = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY)) || {}; }
+  catch { STATE.modelCache = {}; }
+}
+function saveProcCache() {
+  try { localStorage.setItem(PROC_CACHE_KEY, JSON.stringify(STATE.procCache)); } catch {}
+}
+function saveModelCache() {
+  try { localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify(STATE.modelCache)); } catch {}
+}
+
+// Cheap stable signature of the current result set; changes when the set of
+// images changes, so caches built for a different scan don't apply.
+function resultsSignature() {
+  const s = STATE.results.map((r) => r.result).join("|");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return `${STATE.results.length}:${h}`;
+}
+
+const procVersion = (p) => (typeof p.version === "number" ? p.version : 1);
+const modelVersion = (m) => (typeof m.version === "number" ? m.version : 0);
+
+function processorCacheValid(p, sig) {
+  const c = STATE.procCache[p.id];
+  return !!c && c.version === procVersion(p) && c.sig === sig;
+}
+function modelCacheValid(m, sig) {
+  const c = STATE.modelCache[m.id];
+  return !!c && c.version === modelVersion(m) && c.sig === sig;
+}
+
+// Derive STATE.procResult (the pipeline match: passed EVERY active processor)
+// from the per-processor caches.
+function buildProcResultFromCache(active) {
+  const sets = active.map((p) => new Set((STATE.procCache[p.id] || {}).matched || []));
+  const matched = new Set();
+  const reasons = {};
+  const evaluated = [];
+  for (const r of STATE.results) {
+    const rp = r.result;
+    evaluated.push(rp);
+    let keep = true;
+    for (let i = 0; i < active.length; i++) {
+      if (!sets[i].has(rp)) {
+        keep = false;
+        reasons[rp] = `Filtered by "${active[i].name}"`;
+        break;
+      }
+    }
+    if (keep) matched.add(rp);
+  }
+  STATE.procResult = { matched, reasons, evaluated };
+}
+
 async function runProcessors() {
   if (STATE.runningProcessors) return;
 
   const active = STATE.processors.filter((p) => p.active);
   if (active.length === 0) {
+    STATE.procResult = null;
     updateFilterStatusText("No active processors to run.", true);
+    applyAllFilters();
     return;
   }
 
@@ -2062,6 +2740,7 @@ async function runProcessors() {
   for (const p of active) {
     try {
       compiled.push({
+        p,
         name: p.name,
         fn: new Function(...PROCESSOR_ARG_NAMES, p.code),
       });
@@ -2085,10 +2764,31 @@ async function runProcessors() {
     }
   }
 
-  STATE._compiledRun = compiled;
+  // Cache fast-path: if every active processor already has a valid cached result
+  // for these exact images + versions, derive the filter instantly — no pose
+  // data fetch, no image loading, no JS evaluation.
+  const sig = resultsSignature();
+  if (compiled.every((c) => processorCacheValid(c.p, sig))) {
+    buildProcResultFromCache(active);
+    applyAllFilters();
+    const kept = keptResults().length;
+    updateFilterStatusText(
+      `Done (cached): ${kept} kept of ${STATE.results.length}.` +
+        (STATE.invertFilter ? " Inverted." : "") +
+        (STATE.limitCount > 0 ? ` Limited to ${kept}.` : ""),
+      false,
+    );
+    return;
+  }
+
+  STATE._run = { compiled, active, sig };
   STATE.runningProcessors = true;
   setRunButton(true);
   updateFilterStatusText("Loading pose data…");
+
+  // Make sure lil-gui is available before the processors run so any f_gui()
+  // controls can be created synchronously during the run.
+  await ensureLilGui();
 
   const sent = sendMessage({ type: "get_all_pose_data" });
   if (!sent) {
@@ -2106,21 +2806,31 @@ function setRunButton(running) {
 
 async function handleAllPoseData(msg) {
   if (!STATE.runningProcessors) return;
-  const compiled = STATE._compiledRun || [];
+  const run = STATE._run || {};
+  const compiled = run.compiled || [];
+  const active = run.active || [];
+  const sig = run.sig || resultsSignature();
   const items = msg.items || [];
 
   if (msg.error) {
     STATE.runningProcessors = false;
+    STATE._run = null;
     setRunButton(false);
     updateFilterStatusText(`Run failed: ${msg.error}`, true);
     return;
   }
 
-  const filtered = {};
-  let passed = 0;
+  // Rebuild the processor GUI panel for this run; f_gui() re-adds controls as
+  // they're referenced, reusing values the user entered on a previous run.
+  rebuildProcessorGui();
+
   let errors = 0;
   // First runtime error seen per processor: name -> { error, loc, image }.
   const procErrors = new Map();
+  // Per-processor matched sets — cached independently so each processor's result
+  // can be reused without re-running the others.
+  const perProc = new Map();
+  for (const c of compiled) perProc.set(c.p.id, new Set());
 
   // Resolve image dimensions with limited concurrency so we don't open
   // hundreds of image requests at once. This is the slow part of a run, so
@@ -2156,20 +2866,20 @@ async function handleAllPoseData(msg) {
       n_scl_x: dims.width || (pose && pose.image_width) || 0,
       n_scl_y: dims.height || (pose && pose.image_height) || 0,
       n_persons: a_o_person.length,
+      a_s_tag: (STATE.tags[item.result] || []).slice(),
       a_o_person,
     };
 
     const procArgs = processorArgs(o_img, pose);
 
-    let keep = true;
-    let reason = "";
+    // Evaluate EVERY processor (no short-circuit) so each one's result can be
+    // cached. A throwing processor is treated as a pass (doesn't filter).
     for (const proc of compiled) {
       let result;
       try {
         result = proc.fn(...procArgs);
       } catch (e) {
         errors++;
-        // A throwing processor neither keeps nor filters; record and continue.
         if (!procErrors.has(proc.name)) {
           procErrors.set(proc.name, {
             error: e,
@@ -2177,32 +2887,37 @@ async function handleAllPoseData(msg) {
             image: o_img.s_name_file,
           });
         }
-        console.error(
-          `Processor "${proc.name}" threw on ${o_img.s_name_file}:`,
-          e,
-        );
-        continue;
+        console.error(`Processor "${proc.name}" threw on ${o_img.s_name_file}:`, e);
+        result = true;
       }
-      if (!result) {
-        keep = false;
-        reason = `Filtered by "${proc.name}"`;
-        break;
-      }
+      if (result) perProc.get(proc.p.id).add(item.result);
     }
-
-    if (keep) passed++;
-    else filtered[item.result] = reason;
   }
 
-  STATE.filteredOut = filtered;
-  STATE.runningProcessors = false;
-  STATE._compiledRun = null;
-  setRunButton(false);
-  renderImageList();
+  // Persist each processor's cache, then derive the pipeline result from it.
+  for (const c of compiled) {
+    STATE.procCache[c.p.id] = {
+      version: procVersion(c.p),
+      sig,
+      matched: [...perProc.get(c.p.id)],
+    };
+  }
+  saveProcCache();
 
-  const filteredCount = Object.keys(filtered).length;
-  let summary =
-    `Done: ${passed} kept, ${filteredCount} filtered out of ${items.length}.`;
+  STATE.runningProcessors = false;
+  STATE._run = null;
+  setRunButton(false);
+  buildProcResultFromCache(active);
+  applyAllFilters();
+
+  const matchedCount = STATE.procResult.matched.size;
+  const total = STATE.results.length;
+  const keptCount = keptResults().length; // after invert + limit
+  let summary = STATE.invertFilter
+    ? `Done: ${total - matchedCount} not matched (inverted), ${matchedCount} matched, of ${total}.`
+    : `Done: ${matchedCount} matched, ${total - matchedCount} filtered out of ${total}.`;
+  if (STATE.limitCount > 0) summary += ` Limited to ${keptCount}.`;
+  const filteredCount = total - keptCount;
   if (errors > 0) {
     const [name, info] = [...procErrors.entries()][0];
     const emsg = info.error && info.error.message
@@ -2287,6 +3002,10 @@ function saveState() {
   const state = {
     scanPath: FILE_BROWSER.scanPath,
     extFilter: document.getElementById("ext-filter")?.value || ".jpg,.jpeg,.png",
+    exportFolder: STATE.exportFolder,
+    activeTag: STATE.activeTag,
+    invertFilter: STATE.invertFilter,
+    limitCount: STATE.limitCount,
   };
   try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch {}
 }
@@ -2297,6 +3016,10 @@ function loadState() {
     if (!raw) return;
     const state = JSON.parse(raw);
     if (state.scanPath) FILE_BROWSER.scanPath = state.scanPath;
+    if (state.exportFolder) STATE.exportFolder = state.exportFolder;
+    if (typeof state.activeTag === "string") STATE.activeTag = state.activeTag;
+    if (typeof state.invertFilter === "boolean") STATE.invertFilter = state.invertFilter;
+    if (typeof state.limitCount === "number") STATE.limitCount = state.limitCount;
     const extInput = document.getElementById("ext-filter");
     if (extInput && state.extFilter) extInput.value = state.extFilter;
     const scanInput = document.getElementById("folder-path");
@@ -2873,6 +3596,15 @@ function applyInferenceModel() {
     return;
   }
 
+  // Cache fast-path: the model's per-image scores are cached by version + image
+  // set, so re-applying — even at a different threshold — needs no Python run.
+  const model = STATE.inferenceModels.find((m) => m.id === id);
+  const sig = resultsSignature();
+  if (model && modelCacheValid(model, sig)) {
+    applyModelScores(id, STATE.inferenceThreshold, STATE.modelCache[id].prob, true);
+    return;
+  }
+
   STATE.applyingInference = true;
   if (DOM.btnApplyInference) {
     DOM.btnApplyInference.disabled = true;
@@ -2906,33 +3638,52 @@ function handleInferenceModelApplied(msg) {
     return;
   }
 
+  // Cache the per-image probabilities (keyed by the model's version + image set)
+  // so future applies / threshold tweaks skip the Python run.
   const model = STATE.inferenceModels.find((m) => m.id === msg.id);
+  const prob = {};
+  for (const [rp, res] of Object.entries(msg.results || {})) {
+    if (res && typeof res.prob === "number") prob[rp] = res.prob;
+  }
+  if (model) {
+    STATE.modelCache[msg.id] = { version: modelVersion(model), sig: resultsSignature(), prob };
+    saveModelCache();
+  }
+
+  applyModelScores(msg.id, msg.threshold, prob, false);
+}
+
+// Compute the inference filter for `modelId` at `threshold` from a per-image
+// probability map (server-fresh or cached). Shared by the live and cached paths.
+function applyModelScores(modelId, threshold, prob, fromCache) {
+  const model = STATE.inferenceModels.find((m) => m.id === modelId);
   const modelName = model ? model.name : "model";
-  const results = msg.results || {};
 
   const filtered = {};
   let passed = 0;
   let scored = 0;
   for (const r of STATE.results) {
-    const res = results[r.result];
-    if (!res) continue; // failed/unscored images aren't touched by the filter
+    const p = prob[r.result];
+    if (p === undefined) continue; // failed/unscored images aren't touched
     scored++;
-    if (res.pass) {
+    if (p >= threshold) {
       passed++;
     } else {
-      filtered[r.result] = `Below threshold ${msg.threshold.toFixed(2)} ` +
-        `(model "${modelName}", score ${(res.prob ?? 0).toFixed(2)})`;
+      filtered[r.result] = `Below threshold ${threshold.toFixed(2)} ` +
+        `(model "${modelName}", score ${p.toFixed(2)})`;
     }
   }
 
   STATE.inferenceFilteredOut = filtered;
-  STATE.appliedInferenceId = msg.id;
+  STATE.appliedInferenceId = modelId;
   if (DOM.btnClearInference) DOM.btnClearInference.classList.remove("hidden");
 
+  recomputeLimit(); // the limit applies after the inference filter
   renderImageList();
   const hidden = Object.keys(filtered).length;
   setInferenceFilterStatus(
-    `"${modelName}": ${passed} passed, ${hidden} filtered of ${scored} scored.`,
+    `"${modelName}": ${passed} passed, ${hidden} filtered of ${scored} scored.` +
+      (fromCache ? " (cached)" : ""),
     hidden > 0,
   );
 }
@@ -2942,6 +3693,7 @@ function clearInferenceFilter() {
   STATE.appliedInferenceId = null;
   if (DOM.btnClearInference) DOM.btnClearInference.classList.add("hidden");
   setInferenceFilterStatus("");
+  recomputeLimit(); // the limit set may grow now that the inference filter is gone
   renderImageList();
 }
 
@@ -2958,6 +3710,8 @@ function setInferenceFilterStatus(text, highlight) {
 
 document.addEventListener("DOMContentLoaded", () => {
   loadState();
+  loadTags();
+  loadCaches();
   initScanPage();
   initLogPage();
   initPreviewPage();

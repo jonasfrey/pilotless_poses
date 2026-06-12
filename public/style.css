@@ -398,6 +398,43 @@ input[type="text"]::placeholder { color: var(--text-muted); }
   animation: log-pulse 1.4s ease-in-out infinite;
 }
 
+/* Live Log overlay — floating panel toggled from the header, on any page. */
+.log-overlay {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  width: min(560px, 92vw);
+  height: min(60vh, 560px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  z-index: 1000;
+  padding: 0.75rem;
+}
+.log-overlay .live-log-header { margin-bottom: 0.5rem; }
+.log-overlay .live-log {
+  margin-top: 0;
+  height: auto;
+  min-height: 0;
+  flex: 1;
+}
+/* Header toggle button: highlighted when open, pulsing while a scan runs. */
+.log-toggle.active { border-color: var(--accent); color: var(--text-primary); }
+.log-toggle.live { border-color: var(--green-dim); color: var(--green); }
+.log-toggle.live::after {
+  content: "";
+  display: inline-block;
+  width: 6px; height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  vertical-align: middle;
+  animation: log-pulse 1.4s ease-in-out infinite;
+}
+
 .live-log {
   margin-top: 0.75rem;
   height: 60vh;
@@ -533,6 +570,105 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 }
 .image-item .status-dot.ok { background: var(--green); }
 .image-item .status-dot.error { background: var(--red); }
+
+/* Manual-mark (★) toggle on each image row + the active image's toolbar/badge. */
+/* Export action (copy kept images to a folder). */
+.export-row {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin: 0.4rem 0.25rem 0.2rem;
+}
+.export-folder-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+  font-size: 0.78rem;
+}
+.export-row .btn { flex-shrink: 0; }
+
+.image-item .mark-star {
+  flex-shrink: 0;
+  margin-left: 0.25rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 0.95rem;
+  line-height: 1;
+  color: var(--text-muted);
+  opacity: 0.55;
+  transition: opacity var(--transition), color var(--transition);
+}
+.image-item .mark-star:hover { opacity: 1; }
+.image-item .mark-star.marked { color: var(--yellow, #f0c145); opacity: 1; }
+.image-item.marked { border-color: var(--yellow, #f0c145); }
+.marked-badge { background: var(--yellow, #f0c145); color: #1b1b1b; }
+
+/* Limit input in the sidebar controls. */
+.limit-control { display: inline-flex; align-items: center; gap: 0.3rem; }
+.limit-input {
+  width: 3.5rem;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.15rem 0.3rem;
+  font: inherit;
+  font-size: 0.75rem;
+}
+
+/* Active-tag input row. */
+.tag-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.4rem 0.25rem 0.2rem;
+}
+.tag-row-label {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+.tag-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+  font-size: 0.78rem;
+}
+/* Per-image tag chips. */
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 2px;
+}
+.tag-chip {
+  font-size: 0.6rem;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tag-chip.active {
+  background: var(--yellow-dim, #6b5820);
+  color: var(--yellow, #f0c145);
+}
 
 /* Viewer — a stable column whose canvas area always fills the same space,
    regardless of whether pose data is present. */
@@ -811,6 +947,56 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 .pipeline-hint {
   margin: 0 0.25rem 0.5rem;
 }
+/* Host for lil-gui controls a processor creates via f_gui(). lil-gui injects
+   its own styles; constrain it to the sidebar width. */
+.processor-gui-host {
+  margin-top: 0.5rem;
+  flex-shrink: 0;
+}
+.processor-gui-host .lil-gui.root {
+  --width: 100%;
+  width: 100%;
+}
+.processor-gui-host .lil-gui {
+  --background-color: var(--surface, #1e1e1e);
+  --font-family: var(--font-mono, monospace);
+}
+/* Native fallback controls (when lil-gui can't load). */
+.processor-gui-host .pg-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.35rem;
+}
+.processor-gui-host .pg-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+}
+.processor-gui-host .pg-label {
+  flex: 0 0 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.processor-gui-host .pg-input[type="text"],
+.processor-gui-host .pg-input[type="number"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.2rem 0.35rem;
+  font: inherit;
+}
+.processor-gui-host .pg-input[type="checkbox"] { margin-left: auto; }
 .processor-order-list {
   flex: 1;
   overflow-y: auto;
@@ -864,6 +1050,31 @@ input[type="text"]::placeholder { color: var(--text-muted); }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Inactive processors are dimmed; their order number is muted. */
+.processor-order-entry.inactive { opacity: 0.6; }
+.processor-order-entry.inactive .po-num {
+  background: var(--border);
+  color: var(--text-muted);
+}
+/* Quick enable/disable toggle inside the pipeline row. */
+.processor-order-entry .p-toggle {
+  flex-shrink: 0;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.processor-order-entry .p-toggle.on {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: var(--green);
 }
 
 /* Editor panel */

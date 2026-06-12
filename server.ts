@@ -52,6 +52,9 @@ interface Processor {
   name: string;
   code: string;
   active: boolean;
+  // Bumped whenever `code` changes. Clients key their result cache on it, so a
+  // code edit invalidates the cache; toggling active does NOT bump it.
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -94,6 +97,15 @@ interface WriteFileMessage {
   dataBase64: string;
 }
 
+interface ExportImagesMessage {
+  type: "export_images";
+  // Destination folder, relative to the server's working directory.
+  folder: string;
+  // The images to export (the client-side kept set). result is the manifest
+  // pose-JSON path; both the image and its pose JSON are copied.
+  items: Array<{ source: string; result: string }>;
+}
+
 interface InferenceMetrics {
   nPos: number;
   nNeg: number;
@@ -114,6 +126,9 @@ interface InferenceModel {
   metrics?: InferenceMetrics;
   error?: string;
   trainedAt?: string;
+  // Bumped on every successful (re)train. Clients key their score cache on it,
+  // so retraining invalidates the cache.
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -160,6 +175,7 @@ type ClientMessage =
   | ReorderProcessorsMessage
   | GetAllPoseDataMessage
   | WriteFileMessage
+  | ExportImagesMessage
   | ListInferenceModelsMessage
   | SaveInferenceModelMessage
   | DeleteInferenceModelMessage
@@ -258,6 +274,14 @@ interface AllPoseDataMessage {
   error?: string;
 }
 
+interface ExportResultMessage {
+  type: "export_result";
+  folder: string;
+  copied: number;
+  failed: number;
+  errors: Array<{ file: string; error: string }>;
+}
+
 interface InferenceModelsListMessage {
   type: "inference_models_list";
   models: InferenceModel[];
@@ -292,6 +316,7 @@ type ServerMessage =
   | ProcessorsListMessage
   | AllPoseDataMessage
   | WriteFileResultMessage
+  | ExportResultMessage
   | ScanLogMessage
   | InferenceModelsListMessage
   | InferenceModelTrainedMessage
@@ -1342,30 +1367,22 @@ console.log(
 return false; // nobody has a hand raised — filter this image out
 `;
 
-// Built-in processor that copies every image reaching it into ./filtered_images.
-// It keeps all images (always returns true), so place it LAST in the pipeline:
-// then it only sees images that survived the earlier filters. Writing happens
-// through f_deno_write_file, the server-side Deno.writeFile proxy.
-const SAVE_IMAGES_CODE =
-  `// Save each surviving image and its pose JSON into ./filtered_images, then
-// keep it. Put this processor LAST in the pipeline so only the images that
-// passed the earlier filters get saved.
+// Built-in processor that keeps only images carrying a given tag. The tag name
+// is a parameter (f_gui), so the same processor works for any tag. Pairs with a
+// coarse filter: run e.g. hands_in_air first, tag the keepers in the preview,
+// then use this to keep exactly the tagged set before Exporting.
+const HAS_TAG_CODE =
+  `// Keep only images carrying a given tag. Set the tag in the "Processor
+// controls" panel (defaults to "marked_hands_in_the_air").
 //
-// f_save_filtered() copies both the image file and its <name>_pose.json. It's
-// fire-and-forget here: the predicate returns immediately while the copy runs.
-const DEST_DIR = "./filtered_images";
-f_save_filtered(DEST_DIR)
-  .then((ok) =>
-    console.log(
-      ok
-        ? \`[save_images] saved "\${o_img.s_name_file}" + pose JSON -> \${DEST_DIR}\`
-        : \`[save_images] save incomplete for "\${o_img.s_name_file}"\`,
-    )
-  )
-  .catch((err) =>
-    console.error(\`[save_images] failed "\${o_img.s_name_file}":\`, err)
-  );
-return true; // never filters — only saves
+// Tag images in the preview: type a tag in the "Active tag" box, then press "m"
+// (or click the ★ on a row) to toggle that tag on an image. An image can carry
+// several tags; o_img.a_s_tag is the array of its tags.
+//
+// Workflow: run a coarse filter like hands_in_air, tag the keepers, then enable
+// this processor to narrow to the tagged set before using Export.
+const tag = f_gui("Tag", "marked_hands_in_the_air");
+return (o_img.a_s_tag || []).includes(tag);
 `;
 
 // Built-in example processors that ship with the app. Stable ids + fixed
@@ -1377,16 +1394,18 @@ function exampleProcessors(): Processor[] {
       name: "hands_in_air",
       code: HANDS_IN_AIR_CODE,
       active: true,
+      version: 1,
       createdAt: EXAMPLE_TIMESTAMP,
       updatedAt: EXAMPLE_TIMESTAMP,
     },
     {
-      id: "example-save_images",
-      name: "save_images",
-      code: SAVE_IMAGES_CODE,
-      // Off by default so images aren't written to disk unexpectedly; the user
-      // enables it and orders it last in the pipeline when they want to export.
+      id: "example-has_tag",
+      name: "has_tag",
+      code: HAS_TAG_CODE,
+      // Off by default: with no images tagged it would filter everything out.
+      // The user tags images, then enables and orders it in the pipeline.
       active: false,
+      version: 1,
       createdAt: EXAMPLE_TIMESTAMP,
       updatedAt: EXAMPLE_TIMESTAMP,
     },
@@ -1417,6 +1436,17 @@ async function loadProcessors(): Promise<Processor[]> {
     existed = false; // first run, or unreadable — start from the examples
   }
 
+  // Migration: drop retired built-ins from existing installs. save_images was
+  // replaced by the dedicated Export action; all_marked_manual by the
+  // tag-based has_tag processor. Custom processors (random ids) are untouched.
+  const RETIRED_EXAMPLE_IDS = new Set([
+    "example-save_images",
+    "example-all_marked_manual",
+  ]);
+  const beforeLen = userList.length;
+  userList = userList.filter((p) => !RETIRED_EXAMPLE_IDS.has(p.id));
+  const removedRetired = userList.length !== beforeLen;
+
   // Refresh the code of built-in examples the user hasn't modified, so
   // improvements to the built-ins reach existing installs. An example counts as
   // "unmodified" while its timestamp still equals EXAMPLE_TIMESTAMP (editing it
@@ -1424,10 +1454,13 @@ async function loadProcessors(): Promise<Processor[]> {
   const examplesById = new Map(exampleProcessors().map((e) => [e.id, e]));
   let changed = false;
   for (const p of userList) {
+    // Backfill version for processors saved before versioning existed.
+    if (typeof p.version !== "number") { p.version = 1; changed = true; }
     const ex = examplesById.get(p.id);
     if (ex && p.updatedAt === EXAMPLE_TIMESTAMP && p.code !== ex.code) {
       p.code = ex.code;
       p.name = ex.name;
+      p.version = (p.version || 1) + 1; // code changed -> invalidate caches
       changed = true;
     }
   }
@@ -1443,7 +1476,7 @@ async function loadProcessors(): Promise<Processor[]> {
     }
   }
 
-  if (!existed || added || changed) {
+  if (!existed || added || changed || removedRetired) {
     try {
       await saveProcessors(userList);
     } catch {
@@ -1489,6 +1522,11 @@ async function handleSaveProcessor(
     if (incoming.id) {
       const existing = processors.find((p) => p.id === incoming.id);
       if (existing) {
+        // Bump version only when the code actually changes (so toggling active
+        // or renaming doesn't invalidate a client's result cache).
+        if (existing.code !== incoming.code) {
+          existing.version = (existing.version || 1) + 1;
+        }
         existing.name = incoming.name;
         existing.code = incoming.code;
         existing.active = incoming.active;
@@ -1499,6 +1537,7 @@ async function handleSaveProcessor(
           name: incoming.name,
           code: incoming.code,
           active: incoming.active,
+          version: 1,
           createdAt: now,
           updatedAt: now,
         });
@@ -1509,6 +1548,7 @@ async function handleSaveProcessor(
         name: incoming.name,
         code: incoming.code,
         active: incoming.active,
+        version: 1,
         createdAt: now,
         updatedAt: now,
       });
@@ -1611,6 +1651,88 @@ async function handleWriteFile(
   }
 }
 
+// ---- Image export -----------------------------------------------------------
+//
+// A first-class action (not a processor): copy the images the client decided to
+// keep — plus each one's pose JSON — into a folder, server-side via
+// Deno.copyFile (no browser round-trip). Idempotent (overwrites in place) and
+// reports a real per-file summary.
+async function handleExportImages(
+  ws: WebSocket,
+  msg: ExportImagesMessage,
+  connManager: ConnectionManager,
+): Promise<void> {
+  const folderRaw = (msg.folder ?? "").trim();
+  // Keep the destination inside the working directory: strip leading slashes,
+  // reject parent traversal — same rules as handleWriteFile.
+  const folder = folderRaw.replace(/^\/+/, "");
+  const items = Array.isArray(msg.items) ? msg.items : [];
+  const log = (line: string, level: "info" | "python" | "error" = "info") =>
+    broadcastScanLog(connManager, line, level);
+
+  if (!folder || folder.includes("..")) {
+    connManager.send(ws, {
+      type: "export_result",
+      folder: folderRaw,
+      copied: 0,
+      failed: 0,
+      errors: [{ file: "", error: `Invalid destination folder: "${folderRaw}"` }],
+    });
+    return;
+  }
+
+  log(`▶ Exporting ${items.length} image(s) to ./${folder}…`);
+  try {
+    await ensureDir(folder);
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    log(`Export failed: could not create ./${folder}: ${error}`, "error");
+    connManager.send(ws, {
+      type: "export_result",
+      folder,
+      copied: 0,
+      failed: items.length,
+      errors: [{ file: "", error: `Could not create folder: ${error}` }],
+    });
+    return;
+  }
+
+  let copied = 0;
+  let failed = 0;
+  const errors: Array<{ file: string; error: string }> = [];
+
+  for (const it of items) {
+    const source = it?.source ?? "";
+    const basename = source.split("/").pop() || source;
+    try {
+      // Copy the source image (its name is kept as-is).
+      await Deno.copyFile(source, `${folder}/${basename}`);
+      // Copy its pose JSON alongside, preserving the canonical <base>_pose.json
+      // name. Missing pose JSON isn't fatal — the image still exports.
+      const resolved = it?.result ? await resolveResultPath(it.result) : null;
+      if (resolved) {
+        const jsonName = resolved.split("/").pop() || `${basename}_pose.json`;
+        await Deno.copyFile(resolved, `${folder}/${jsonName}`);
+      }
+      copied++;
+    } catch (e) {
+      failed++;
+      if (errors.length < 50) {
+        errors.push({ file: basename, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    if ((copied + failed) % 25 === 0) {
+      log(`  …exported ${copied + failed}/${items.length}`);
+    }
+  }
+
+  log(
+    `✓ Export complete: ${copied} copied, ${failed} failed -> ./${folder}`,
+    failed > 0 ? "error" : "info",
+  );
+  connManager.send(ws, { type: "export_result", folder, copied, failed, errors });
+}
+
 // ---- Inference models -------------------------------------------------------
 
 const INFERENCE_MODELS_PATH = "./inference_models.json";
@@ -1640,6 +1762,11 @@ async function loadInferenceModels(): Promise<InferenceModel[]> {
   //     so the UI doesn't offer Apply for a model that can't run.
   let changed = false;
   for (const m of models) {
+    // Backfill version for models saved before versioning existed.
+    if (typeof m.version !== "number") {
+      m.version = m.status === "trained" ? 1 : 0;
+      changed = true;
+    }
     if (m.status === "training" && !activeTrainings.has(m.id)) {
       m.status = "error";
       m.error = "Training was interrupted (server restarted). Train again.";
@@ -1772,6 +1899,7 @@ async function handleSaveInferenceModel(
         positiveDir: incoming.positiveDir,
         negativeDir: incoming.negativeDir,
         status: "untrained",
+        version: 0, // bumped on first successful train
         createdAt: now,
         updatedAt: now,
       });
@@ -1890,6 +2018,7 @@ async function trainInferenceModelInner(
       m.error = undefined;
       m.trainedAt = new Date().toISOString();
       m.updatedAt = m.trainedAt;
+      m.version = (m.version || 0) + 1; // new artifact -> invalidate score cache
       await saveInferenceModels(fresh);
     }
 
@@ -2189,6 +2318,9 @@ async function handleRequest(
           break;
         case "write_file":
           await handleWriteFile(socket, msg, connManager);
+          break;
+        case "export_images":
+          await handleExportImages(socket, msg, connManager);
           break;
         case "list_inference_models":
           await handleListInferenceModels(socket, connManager);

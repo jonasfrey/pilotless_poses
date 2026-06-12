@@ -12,16 +12,36 @@
     <span class="subtitle">Batch Pose Detection with VitPose</span>
     <nav class="nav-tabs">
       <button id="nav-scan"  class="nav-tab active" data-page="scan">Folder Scan</button>
-      <button id="nav-log" class="nav-tab" data-page="log">Live Log</button>
       <button id="nav-preview" class="nav-tab" data-page="preview">Image Preview</button>
       <button id="nav-processors" class="nav-tab" data-page="processors">Processors</button>
       <button id="nav-inference" class="nav-tab" data-page="inference">Inference Models</button>
     </nav>
+    <button id="btn-toggle-log" class="btn btn-sm log-toggle" title="Show/hide the live server log (visible from any page)">
+      Live Log
+    </button>
     <div class="connection-indicator" id="connection-indicator" title="WebSocket status">
       <span class="dot"></span>
       <span class="label">Disconnected</span>
     </div>
   </header>
+
+  <!-- Live Log — a floating overlay toggled from the header, visible on any page -->
+  <div id="log-overlay" class="log-overlay hidden" role="dialog" aria-label="Live Server Log">
+    <div class="live-log-header">
+      <h2>Live Server Log</h2>
+      <span id="log-status" class="log-status idle">Idle</span>
+      <div class="live-log-controls">
+        <label class="autoscroll-control" title="Keep scrolling to the newest line">
+          <input type="checkbox" id="chk-log-autoscroll" checked> Auto-scroll
+        </label>
+        <button id="btn-clear-log" class="btn btn-secondary btn-sm">Clear</button>
+        <button id="btn-close-log" class="btn btn-secondary btn-sm" title="Close (Esc)">✕</button>
+      </div>
+    </div>
+    <div id="live-log" class="live-log">
+      <div class="live-log-placeholder">No activity yet. Start a scan to see live progress.</div>
+    </div>
+  </div>
 
   <!-- ================================================================== -->
   <!-- Page 1: Folder Scan                                                 -->
@@ -75,33 +95,7 @@
   </main>
 
   <!-- ================================================================== -->
-  <!-- Page 2: Live Log                                                    -->
-  <!-- ================================================================== -->
-  <main id="page-log" class="page">
-    <section class="card live-log-card">
-      <div class="live-log-header">
-        <h2>Live Server Log</h2>
-        <span id="log-status" class="log-status idle">Idle</span>
-        <div class="live-log-controls">
-          <label class="autoscroll-control" title="Keep scrolling to the newest line">
-            <input type="checkbox" id="chk-log-autoscroll" checked> Auto-scroll
-          </label>
-          <button id="btn-clear-log" class="btn btn-secondary btn-sm">Clear</button>
-        </div>
-      </div>
-      <p class="hint">
-        Real-time output from the server while a scan runs — folder scanning,
-        model loading, and per-image inference progress streamed straight from
-        the Python process.
-      </p>
-      <div id="live-log" class="live-log">
-        <div class="live-log-placeholder">No activity yet. Start a scan to see live progress.</div>
-      </div>
-    </section>
-  </main>
-
-  <!-- ================================================================== -->
-  <!-- Page 3: Image Preview                                               -->
+  <!-- Page 2: Image Preview                                               -->
   <!-- ================================================================== -->
   <main id="page-preview" class="page">
     <section class="card" id="preview-main">
@@ -112,6 +106,7 @@
           <div class="sidebar-header">
             <h3>Images</h3>
             <span id="image-count" class="badge">0</span>
+            <span id="marked-count" class="badge marked-badge hidden" title="Images tagged with the active tag">🏷 0</span>
           </div>
           <div class="sidebar-controls">
             <button id="btn-run-processors" class="btn btn-primary btn-sm" title="Run all images against active processors">
@@ -123,8 +118,23 @@
             <label class="show-filtered-control" title="Show images whose pose inference failed">
               <input type="checkbox" id="chk-show-failed"> Show failed
             </label>
+            <label class="show-filtered-control" title="Keep the images that do NOT match the processors instead of the ones that do">
+              <input type="checkbox" id="chk-invert-filter"> Invert
+            </label>
+            <label class="show-filtered-control limit-control" title="Cap the kept set to at most this many images (0 = no limit)">
+              Limit <input type="number" id="limit-count" class="limit-input" min="0" step="1" value="0">
+            </label>
+          </div>
+          <div class="tag-row" title="The tag that pressing M (or the ★ on a row) toggles on an image">
+            <span class="tag-row-label">Active tag</span>
+            <input type="text" id="active-tag" class="tag-input" placeholder="tag name" value="marked_hands_in_the_air">
           </div>
           <div id="processor-filter-status" class="processor-filter-status"></div>
+          <div class="export-row" title="Copy the images that passed your filters (and their pose JSON) into this folder">
+            <input type="text" id="export-folder" class="export-folder-input" placeholder="folder name" value="filtered_images">
+            <button id="btn-export-images" class="btn btn-secondary btn-sm">Export</button>
+          </div>
+          <div id="export-status" class="processor-filter-status"></div>
           <div id="image-list" class="image-list">
             <div class="placeholder">No images loaded. Run a scan first, then switch to this tab.</div>
           </div>
@@ -158,10 +168,12 @@
             <h3>Pipeline</h3>
             <span id="processor-order-count" class="badge">0</span>
           </div>
-          <p class="hint pipeline-hint">Active processors, applied top to bottom. Drag to reorder.</p>
+          <p class="hint pipeline-hint">All processors. Toggle On/Off to enable; active ones apply top to bottom. Drag to reorder.</p>
           <div id="processor-order-list" class="processor-order-list">
             <div class="placeholder">No active processors.</div>
           </div>
+          <!-- Persistent lil-gui controls rendered by processors via f_gui(). -->
+          <div id="processor-gui-host" class="processor-gui-host hidden"></div>
         </aside>
 
         <!-- Canvas viewer -->
@@ -182,6 +194,9 @@
               </button>
               <button id="btn-toggle-keypoints" class="btn btn-sm" title="Toggle per-keypoint pixel coordinates (K)">
                 Show Keypoints
+              </button>
+              <button id="btn-toggle-mark" class="btn btn-sm" title="Toggle the active tag on this image (M)">
+                ☆ Tag
               </button>
               <button id="btn-reset-view" class="btn btn-sm" title="Reset zoom &amp; pan (0)">
                 Reset View
@@ -253,7 +268,7 @@
             </p>
 
             <div class="editor-fields">
-              <span class="editor-signature">function (o_img, f_deno_write_file, f_save_image, f_save_json, f_save_filtered) {</span>
+              <span class="editor-signature">function (o_img, f_deno_write_file, f_save_image, f_save_json, f_save_filtered, lil_gui, f_gui) {</span>
               <div id="monaco-editor" class="monaco-editor-host"></div>
               <span class="editor-signature">}</span>
             </div>
@@ -274,6 +289,7 @@
                 <li><code>o_img.s_msg_error</code> — error message if inference failed</li>
                 <li><code>o_img.n_scl_x</code>, <code>o_img.n_scl_y</code> — image width / height in pixels</li>
                 <li><code>o_img.n_persons</code> — number of detected people (<code>= o_img.a_o_person.length</code>)</li>
+                <li><code>o_img.a_s_tag</code> — array of tags you've put on this image in the preview (type a tag in "Active tag", press <code>m</code> / click ★). E.g. <code>["marked_hands_in_the_air"]</code>. See the <code>has_tag</code> processor.</li>
                 <li><code>o_img.a_o_person</code> — array of person objects (<code>o_person</code>)</li>
               </ul>
               <p>Each <code>o_person</code> has keypoints grouped by body part. Paired
@@ -292,6 +308,13 @@
                 <li><code>f_save_json(dir)</code> — write this image's pose JSON into <code>dir</code> as <code>&lt;name&gt;_pose.json</code></li>
                 <li><code>f_save_filtered(dir)</code> — do both (image + pose JSON)</li>
                 <li><code>f_deno_write_file(path, data)</code> — low-level <code>Deno.writeFile</code> proxy; <code>data</code> may be a string, <code>Uint8Array</code>, <code>ArrayBuffer</code>, or <code>number[]</code></li>
+              </ul>
+              <p>And these UI helpers for adding controls to the
+              <strong>Processor controls</strong> panel on the preview page
+              (under the Pipeline column):</p>
+              <ul>
+                <li><code>f_gui(label, default)</code> — render a persistent control (text / number / checkbox, by the default's type) and return its current value. The value is remembered across images and runs, so users can type a setting (e.g. a destination folder) once. <em>The control appears the first time a run reaches it.</em></li>
+                <li><code>lil_gui</code> — the raw <a href="https://lil-gui.georgealways.com" target="_blank" rel="noopener">lil-gui</a> namespace for advanced panels, e.g. <code>new lil_gui.GUI()</code> (<code>null</code> if lil-gui can't load offline)</li>
               </ul>
             </details>
           </div>
