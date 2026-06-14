@@ -39,3 +39,6 @@ inference_models/
 
 # Test data (COCO val2017) downloaded on startup
 testdata/
+
+# Generated thumbnail cache (downscaled previews; regenerated on demand)
+thumbnails/

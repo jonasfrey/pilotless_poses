@@ -2290,6 +2290,42 @@ async function resolveResultPath(resultPath: string): Promise<string | null> {
   return null;
 }
 
+// Per-image inference cache lives inside the pose JSON under an "inference"
+// object keyed by model id: { "<modelId>": { name, version, prob, scored } }.
+// We store the probability (not a bare boolean) so the threshold slider stays
+// instant — pass/fail is derived live. The version makes a retrained model's
+// stale cache a miss (so it recomputes).
+async function readCachedInference(
+  resolvedPath: string,
+  modelId: string,
+  version: number,
+): Promise<{ prob: number; scored: boolean } | null> {
+  try {
+    const data = JSON.parse(await Deno.readTextFile(resolvedPath));
+    const e = data?.inference?.[modelId];
+    if (e && e.version === version && typeof e.prob === "number") {
+      return { prob: e.prob, scored: e.scored !== false };
+    }
+  } catch { /* unreadable / missing — treat as a miss */ }
+  return null;
+}
+
+async function writeCachedInference(
+  resolvedPath: string,
+  modelId: string,
+  name: string,
+  version: number,
+  prob: number,
+  scored: boolean,
+): Promise<void> {
+  try {
+    const data = JSON.parse(await Deno.readTextFile(resolvedPath));
+    if (!data.inference || typeof data.inference !== "object") data.inference = {};
+    data.inference[modelId] = { name, version, prob, scored };
+    await Deno.writeTextFile(resolvedPath, JSON.stringify(data, null, 2) + "\n");
+  } catch { /* best-effort; a failed write just means it recomputes next time */ }
+}
+
 async function handleApplyInferenceModel(
   ws: WebSocket,
   msg: ApplyInferenceModelMessage,
@@ -2327,25 +2363,59 @@ async function handleApplyInferenceModel(
       return;
     }
 
-    const stdout = await runInferenceScript(
-      config.pythonPath,
-      [
-        "predict",
-        "--model", out,
-        "--threshold", String(msg.threshold),
-        ...resolvedToOriginal.keys(),
-      ],
+    const version = model.version || 0;
+    const log = (line: string, level: "info" | "python" | "error" = "info") =>
+      logToClient(ws, connManager, line, level);
+
+    // 1) Harvest probabilities already cached in the pose JSONs for this exact
+    //    model version. Only the remainder need Python.
+    const results: Record<string, { prob: number; pass: boolean; scored?: boolean }> = {};
+    const toCompute: string[] = [];
+    for (const [resolved, original] of resolvedToOriginal) {
+      const cached = await readCachedInference(resolved, model.id, version);
+      if (cached) {
+        results[original] = {
+          prob: cached.prob,
+          pass: cached.scored && cached.prob >= msg.threshold,
+          scored: cached.scored,
+        };
+      } else {
+        toCompute.push(resolved);
+      }
+    }
+
+    const cachedCount = resolvedToOriginal.size - toCompute.length;
+    log(
+      `▶ Applying "${model.name}" (v${version}) to ${resolvedToOriginal.size} image(s): ` +
+        `${cachedCount} cached, ${toCompute.length} to score.`,
     );
 
-    const byResolved = JSON.parse(stdout) as Record<
-      string,
-      { prob: number; pass: boolean; scored?: boolean }
-    >;
-
-    // Remap the script's keys (resolved paths) back to manifest result paths.
-    const results: Record<string, { prob: number; pass: boolean; scored?: boolean }> = {};
-    for (const [resolved, original] of resolvedToOriginal) {
-      if (byResolved[resolved]) results[original] = byResolved[resolved];
+    // 2) Run Python only on the uncached images, then persist each score into
+    //    its pose JSON so future applies (even on another machine) skip Python.
+    if (toCompute.length > 0) {
+      const stdout = await runInferenceScript(
+        config.pythonPath,
+        ["predict", "--model", out, "--threshold", String(msg.threshold), ...toCompute],
+        (line) => log(line, "python"),
+      );
+      const byResolved = JSON.parse(stdout) as Record<
+        string,
+        { prob: number; pass: boolean; scored?: boolean }
+      >;
+      let written = 0;
+      for (const resolved of toCompute) {
+        const r = byResolved[resolved];
+        if (!r) continue;
+        const original = resolvedToOriginal.get(resolved)!;
+        const scored = r.scored !== false;
+        results[original] = { prob: r.prob, pass: scored && r.prob >= msg.threshold, scored };
+        await writeCachedInference(resolved, model.id, model.name, version, r.prob, scored);
+        written++;
+        if (written % 500 === 0) log(`  …scored ${written}/${toCompute.length}`);
+      }
+      log(`✓ Scored ${written} image(s); cached results into their pose JSON.`);
+    } else {
+      log("✓ All scores served from cache — no inference needed.");
     }
 
     connManager.send(ws, {
@@ -2405,6 +2475,79 @@ async function handleGetAllPoseData(
 }
 
 // ---- API Handlers -----------------------------------------------------------
+
+// Downscaled thumbnails are generated once with ImageMagick and cached on disk,
+// keyed by a hash of the source path. Serving a tiny ~160px JPEG instead of the
+// multi-MB original keeps the preview list fast even with thousands of images.
+const THUMB_DIR = "./thumbnails";
+const THUMB_SIZE = 160;
+
+async function sha1Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Generate a downscaled JPEG thumbnail of `src` at `out`. Returns true on
+// success. Uses `convert` (ImageMagick), which only shrinks (the trailing ">").
+async function generateThumbnail(src: string, out: string): Promise<boolean> {
+  try {
+    const cmd = new Deno.Command("convert", {
+      args: [
+        src + "[0]", // first frame/layer only
+        "-auto-orient",
+        "-thumbnail", `${THUMB_SIZE}x${THUMB_SIZE}>`,
+        "-quality", "80",
+        out,
+      ],
+      stdout: "null",
+      stderr: "piped",
+    });
+    const { code } = await cmd.output();
+    return code === 0;
+  } catch {
+    return false; // ImageMagick missing or spawn failed
+  }
+}
+
+async function serveThumbnail(url: URL): Promise<Response> {
+  const path = url.searchParams.get("path");
+  if (!path) return new Response("Missing path parameter", { status: 400 });
+  if (path.includes("..")) return new Response("Forbidden", { status: 403 });
+
+  try {
+    if (!(await isFile(path))) return new Response("File not found", { status: 404 });
+    const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
+    if (!isImageExt(ext)) return new Response("Not an image file", { status: 400 });
+
+    await ensureDir(THUMB_DIR);
+    const thumbPath = `${THUMB_DIR}/${await sha1Hex(path)}.jpg`;
+
+    // Regenerate if the thumbnail is missing or older than the source.
+    let fresh = false;
+    try {
+      const [ts, ss] = await Promise.all([Deno.stat(thumbPath), Deno.stat(path)]);
+      fresh = !!ts.mtime && !!ss.mtime && ts.mtime >= ss.mtime;
+    } catch { /* no thumbnail yet */ }
+
+    if (!fresh) {
+      const ok = await generateThumbnail(path, thumbPath);
+      if (!ok) return await serveImage(url); // fall back to the full image
+    }
+
+    const bytes = await Deno.readFile(thumbPath);
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        "content-type": "image/jpeg",
+        "content-length": String(bytes.byteLength),
+        "cache-control": "public, max-age=86400",
+      },
+    });
+  } catch (e) {
+    console.error("Error serving thumbnail:", e);
+    return await serveImage(url); // best-effort fallback
+  }
+}
 
 async function serveImage(url: URL): Promise<Response> {
   const path = url.searchParams.get("path");
@@ -2592,7 +2735,10 @@ async function handleRequest(
   }
 
   // API endpoints
-  if (url.pathname === "/api/image" || url.pathname === "/api/thumbnail") {
+  if (url.pathname === "/api/thumbnail") {
+    return await serveThumbnail(url);
+  }
+  if (url.pathname === "/api/image") {
     return await serveImage(url);
   }
 

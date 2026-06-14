@@ -525,9 +525,13 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 .image-list {
   flex: 1;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  position: relative; /* scroll container for the virtualized rows */
+}
+/* Fixed-height spacer whose height = rowCount * ROW_HEIGHT; rows are absolutely
+   positioned inside it so only the visible window lives in the DOM. */
+.image-list-sizer {
+  position: relative;
+  width: 100%;
 }
 .image-list .placeholder {
   color: var(--text-muted);
@@ -536,6 +540,13 @@ input[type="text"]::placeholder { color: var(--text-muted); }
   text-align: center;
 }
 .image-item {
+  /* Virtualized: absolutely positioned at top = index * ROW_HEIGHT (52px in
+     app.js). Keep height + box-sizing in sync with ROW_HEIGHT. */
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 48px;
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 0.5rem;

@@ -23,6 +23,11 @@ const STATE = {
                          // `${base}_positive` / `${base}_negative` basetag labels
   filterPositive: false, // quick-filter: show only positives for the basetag
   filterNegative: false, // quick-filter: show only negatives for the basetag
+  // Virtualized image-list scratch state (set during render):
+  _visible: [],          // current visibleResults() array
+  _indexByResult: null,  // Map result -> index in STATE.results
+  _sizer: null,          // the fixed-height inner div rows are positioned in
+  _scrollRaf: null,      // rAF handle that throttles scroll re-renders
   exportFolder: "filtered_images", // destination for the Export action (persisted)
   exporting: false,      // true while an export_images request is in flight
   currentResultIndex: -1,
@@ -1022,6 +1027,17 @@ function updateFileLogEntry(msg) {
 
 function initPreviewPage() {
   DOM.imageList = document.getElementById("image-list");
+  // Virtualized list: re-render the visible window on scroll (throttled to one
+  // repaint per frame).
+  if (DOM.imageList) {
+    DOM.imageList.addEventListener("scroll", () => {
+      if (STATE._scrollRaf) return;
+      STATE._scrollRaf = requestAnimationFrame(() => {
+        STATE._scrollRaf = null;
+        renderWindow();
+      });
+    });
+  }
   DOM.imageCount = document.getElementById("image-count");
   DOM.posCount = document.getElementById("pos-count");
   DOM.negCount = document.getElementById("neg-count");
@@ -1513,29 +1529,31 @@ function visibleResults() {
   });
 }
 
+// ---- Virtualized image list -------------------------------------------------
+// Only the rows in (or near) the viewport are in the DOM, so the list stays fast
+// with thousands of images. Rows are absolutely positioned inside a fixed-height
+// "sizer". ROW_HEIGHT must match the .image-item height in style.css.
+const ROW_HEIGHT = 52;
+const ROW_BUFFER = 8;
+
 function renderImageList() {
   if (!DOM.imageList) return;
 
-  DOM.imageList.innerHTML = "";
-
   if (STATE.results.length === 0) {
+    STATE._visible = [];
+    STATE._sizer = null;
     DOM.imageList.innerHTML =
       '<div class="placeholder">No results found for this folder.</div>';
     DOM.imageCount.textContent = "0";
     updateFilterStatus();
+    updateLabelCounts();
     return;
   }
 
   const visible = visibleResults();
-
-  console.log(
-    `[renderImageList] ${STATE.results.length} total, ${
-      Object.keys(STATE.filteredOut).length
-    } filtered by processors, ${
-      Object.keys(STATE.inferenceFilteredOut).length
-    } filtered by inference, ${visible.length} visible ` +
-      `(showFiltered=${STATE.showFiltered}, showFailed=${STATE.showFailed}).`,
-  );
+  STATE._visible = visible;
+  // result -> original index, built once (avoids an O(N) indexOf per row).
+  STATE._indexByResult = new Map(STATE.results.map((r, i) => [r, i]));
 
   DOM.imageCount.textContent = String(visible.length);
   updateFilterStatus();
@@ -1543,76 +1561,110 @@ function renderImageList() {
   updateExportButton();
 
   if (visible.length === 0) {
+    STATE._sizer = null;
     DOM.imageList.innerHTML =
       '<div class="placeholder">No images to show with the current filters.</div>';
     return;
   }
 
-  visible.forEach((r) => {
-    const idx = STATE.results.indexOf(r);
-    const div = document.createElement("div");
-    div.className = "image-item";
-    if (isFilteredOut(r)) div.classList.add("filtered-out");
-    div.dataset.index = idx;
-    div.title = r.source;
+  DOM.imageList.innerHTML = "";
+  const sizer = document.createElement("div");
+  sizer.className = "image-list-sizer";
+  sizer.style.height = `${visible.length * ROW_HEIGHT}px`;
+  DOM.imageList.appendChild(sizer);
+  STATE._sizer = sizer;
+  renderWindow();
+}
 
-    // Thumbnail — use the source image path via a data URL approach
-    // We'll generate a thumbnail URL using the server
-    const thumb = document.createElement("img");
-    thumb.className = "thumb";
-    thumb.src = `/api/thumbnail?path=${encodeURIComponent(r.source)}`;
-    thumb.alt = r.source;
-    thumb.loading = "lazy";
-    thumb.onerror = () => {
-      console.warn(
-        "[thumbnail] failed to load source image:", r.source,
-        "\n  → The server could not serve this path. On a different machine the manifest's",
-        "absolute source paths often don't exist (different home dir / checkout location).",
-      );
-      thumb.src = "";
-    };
+// Render only the rows within the scroll viewport (plus a small buffer).
+function renderWindow() {
+  const visible = STATE._visible;
+  const sizer = STATE._sizer;
+  if (!sizer || !visible) return;
+  const scrollTop = DOM.imageList.scrollTop;
+  const viewport = DOM.imageList.clientHeight || 600;
+  let start = Math.floor(scrollTop / ROW_HEIGHT) - ROW_BUFFER;
+  if (start < 0) start = 0;
+  let end = Math.ceil((scrollTop + viewport) / ROW_HEIGHT) + ROW_BUFFER;
+  if (end > visible.length) end = visible.length;
 
-    const info = document.createElement("div");
-    info.className = "info";
-    const displayName = r.source.split("/").pop() || r.source;
-    const nameEl = document.createElement("span");
-    nameEl.className = "name";
-    nameEl.textContent = displayName;
-    nameEl.title = r.source;
-    const statusEl = document.createElement("span");
-    statusEl.className = "status";
-    statusEl.textContent = r.status === "ok" ? "Pose data available" : (r.error_msg || "Error");
+  const frag = document.createDocumentFragment();
+  for (let i = start; i < end; i++) {
+    const r = visible[i];
+    const div = buildImageRow(r, STATE._indexByResult.get(r));
+    div.style.top = `${i * ROW_HEIGHT}px`;
+    frag.appendChild(div);
+  }
+  sizer.replaceChildren(frag);
+}
 
-    info.appendChild(nameEl);
-    info.appendChild(statusEl);
+// Build a single image-list row.
+function buildImageRow(r, idx) {
+  const div = document.createElement("div");
+  div.className = "image-item";
+  if (isFilteredOut(r)) div.classList.add("filtered-out");
+  if (idx === STATE.currentResultIndex) div.classList.add("active");
+  div.dataset.index = idx;
+  div.title = r.source;
 
-    if (isFilteredOut(r)) {
-      const tag = document.createElement("span");
-      tag.className = "filter-tag";
-      tag.textContent = "filtered";
-      tag.title = filterReason(r) || "Filtered out";
-      info.title = tag.title;
-      div.appendChild(thumb);
-      div.appendChild(info);
-      div.appendChild(tag);
-    } else {
-      const dot = document.createElement("span");
-      dot.className = `status-dot ${r.status}`;
-      div.appendChild(thumb);
-      div.appendChild(info);
-      div.appendChild(dot);
-    }
+  const thumb = document.createElement("img");
+  thumb.className = "thumb";
+  thumb.src = `/api/thumbnail?path=${encodeURIComponent(r.source)}`;
+  thumb.alt = r.source;
+  thumb.loading = "lazy";
+  thumb.onerror = () => { thumb.src = ""; };
 
-    // Positive/negative indicator (↑ / ↓ / none) for the selected basetag.
-    const ind = document.createElement("span");
-    ind.className = "label-indicator";
-    div.appendChild(ind);
-    renderRowLabel(div, r);
+  const info = document.createElement("div");
+  info.className = "info";
+  const nameEl = document.createElement("span");
+  nameEl.className = "name";
+  nameEl.textContent = r.source.split("/").pop() || r.source;
+  nameEl.title = r.source;
+  const statusEl = document.createElement("span");
+  statusEl.className = "status";
+  statusEl.textContent = r.status === "ok" ? "Pose data available" : (r.error_msg || "Error");
+  info.appendChild(nameEl);
+  info.appendChild(statusEl);
 
-    div.addEventListener("click", () => selectImage(idx));
+  if (isFilteredOut(r)) {
+    const tag = document.createElement("span");
+    tag.className = "filter-tag";
+    tag.textContent = "filtered";
+    tag.title = filterReason(r) || "Filtered out";
+    info.title = tag.title;
+    div.appendChild(thumb);
+    div.appendChild(info);
+    div.appendChild(tag);
+  } else {
+    const dot = document.createElement("span");
+    dot.className = `status-dot ${r.status}`;
+    div.appendChild(thumb);
+    div.appendChild(info);
+    div.appendChild(dot);
+  }
 
-    DOM.imageList.appendChild(div);
-  });
+  // Positive/negative indicator (↑ / ↓ / none) for the selected basetag.
+  const ind = document.createElement("span");
+  ind.className = "label-indicator";
+  div.appendChild(ind);
+  renderRowLabel(div, r);
+
+  div.addEventListener("click", () => selectImage(idx));
+  return div;
+}
+
+// Scroll the list so the row for STATE.results[index] is within the viewport.
+function ensureRowVisible(index) {
+  const visible = STATE._visible;
+  if (!visible || !DOM.imageList) return;
+  const vpos = visible.indexOf(STATE.results[index]);
+  if (vpos < 0) return;
+  const top = vpos * ROW_HEIGHT;
+  const bottom = top + ROW_HEIGHT;
+  const st = DOM.imageList.scrollTop;
+  const h = DOM.imageList.clientHeight || 600;
+  if (top < st) DOM.imageList.scrollTop = top;
+  else if (bottom > st + h) DOM.imageList.scrollTop = bottom - h;
 }
 
 function updateFilterStatus() {
@@ -1651,10 +1703,11 @@ function selectImage(index) {
   // Start each image fitted, not at the previous image's zoom/pan.
   STATE.view = { scale: 1, tx: 0, ty: 0 };
 
-  // Update selection highlight
-  document.querySelectorAll(".image-item").forEach((el) => el.classList.remove("active"));
-  const item = document.querySelector(`.image-item[data-index="${index}"]`);
-  if (item) item.classList.add("active");
+  // Update selection highlight: make sure the selected row is in the rendered
+  // window (it may be off-screen after arrow navigation), then repaint the
+  // window so the active class lands on it.
+  ensureRowVisible(index);
+  renderWindow();
 
   // Reflect this image's positive/negative label on the toolbar badge.
   updateCurrentLabel();
@@ -1662,7 +1715,7 @@ function selectImage(index) {
   // Update nav display — show position within the visible (shown) images, not
   // the full result set, so it matches what the arrows actually step through.
   if (DOM.navIndex) {
-    const visible = visibleResults();
+    const visible = STATE._visible || visibleResults();
     const vpos = visible.indexOf(STATE.results[index]);
     DOM.navIndex.textContent = vpos >= 0
       ? `${vpos + 1} / ${visible.length}`
@@ -2068,8 +2121,11 @@ function toggleLabels() {
 }
 
 function navigateImages(delta) {
-  const visible = visibleResults();
+  // Reuse the rendered visible set + index map when available (avoids O(N) work
+  // per arrow press on large datasets); fall back to recomputing if not.
+  const visible = STATE._visible || visibleResults();
   if (visible.length === 0) return;
+  const indexByResult = STATE._indexByResult;
 
   // Step relative to the current image's position WITHIN the visible list. If
   // the current image isn't visible (or none is selected), start from an end so
@@ -2082,7 +2138,9 @@ function navigateImages(delta) {
   if (nextPos < 0) nextPos = visible.length - 1;
   if (nextPos >= visible.length) nextPos = 0;
 
-  selectImage(STATE.results.indexOf(visible[nextPos]));
+  const next = visible[nextPos];
+  const idx = indexByResult ? indexByResult.get(next) : STATE.results.indexOf(next);
+  selectImage(idx);
 }
 
 function handleKeyboard(e) {
@@ -4027,11 +4085,11 @@ function labelCurrent(sign) {
   // list (and re-apply the active highlight); otherwise update just this row so
   // the list doesn't jump-scroll.
   if (STATE.filterPositive || STATE.filterNegative) {
+    // Membership may have changed; rebuild, then keep the current row in view
+    // and highlighted (buildImageRow applies the active class).
     renderImageList();
-    const cur = document.querySelector(
-      `.image-item[data-index="${STATE.currentResultIndex}"]`,
-    );
-    if (cur) cur.classList.add("active");
+    ensureRowVisible(STATE.currentResultIndex);
+    renderWindow();
   } else {
     refreshRowTagUI(STATE.currentResultIndex);
   }
