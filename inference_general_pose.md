@@ -1,5 +1,11 @@
 # Feature request: make AI inference equally good for ANY pose
 
+> **Status: implemented** (feature set v2 in `python/f_o_train_inference.py`).
+> 34 pose-agnostic features added; feature-version gate rejects stale models with
+> a "retrain" message. Existing trained models must be retrained. See below for
+> the original spec.
+
+
 ## Goal
 The inference training should classify **any** pose equally well — not just
 "hands in the air". Today it works for any pose in principle (it's a data-driven

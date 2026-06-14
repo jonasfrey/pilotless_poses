@@ -599,23 +599,59 @@ input[type="text"]::placeholder { color: var(--text-muted); }
 }
 .export-row .btn { flex-shrink: 0; }
 
-.image-item .mark-star {
+/* ---- Basetag positive/negative labels ---- */
+
+/* Header count badges. */
+.pos-badge { background: var(--green); color: #0c1f18; }
+.neg-badge { background: var(--red); color: #2a0c11; }
+
+/* Per-row ↑ / ↓ indicator + colored left edge. */
+.image-item .label-indicator {
   flex-shrink: 0;
   margin-left: 0.25rem;
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 0 2px;
+  width: 1.1rem;
+  text-align: center;
   font-size: 0.95rem;
+  font-weight: 700;
   line-height: 1;
-  color: var(--text-muted);
-  opacity: 0.55;
-  transition: opacity var(--transition), color var(--transition);
 }
-.image-item .mark-star:hover { opacity: 1; }
-.image-item .mark-star.marked { color: var(--yellow, #f0c145); opacity: 1; }
-.image-item.marked { border-color: var(--yellow, #f0c145); }
-.marked-badge { background: var(--yellow, #f0c145); color: #1b1b1b; }
+.image-item .label-indicator.pos { color: var(--green); }
+.image-item .label-indicator.neg { color: var(--red); }
+.image-item .label-indicator.none { color: transparent; }
+.image-item.row-pos {
+  border-left: 3px solid var(--green);
+  background: linear-gradient(90deg, var(--green-dim) 0%, transparent 12%);
+}
+.image-item.row-neg {
+  border-left: 3px solid var(--red);
+  background: linear-gradient(90deg, var(--red-dim) 0%, transparent 12%);
+}
+/* Keep the selection highlight readable on top of a label tint. */
+.image-item.row-pos.active,
+.image-item.row-neg.active { border-color: var(--accent); }
+
+/* Quick-filter toggle buttons. */
+.label-filter-row { margin-top: 0.1rem; }
+.label-filter-btn { flex: 1 1 0; }
+.label-filter-btn.pos.active {
+  background: var(--green-dim); color: var(--green); border-color: var(--green);
+}
+.label-filter-btn.neg.active {
+  background: var(--red-dim); color: var(--red); border-color: var(--red);
+}
+
+/* Toolbar badge: the current image's label. */
+.current-label {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.current-label.pos { background: var(--green-dim); color: var(--green); border-color: var(--green); }
+.current-label.neg { background: var(--red-dim); color: var(--red); border-color: var(--red); }
+.current-label.none { background: var(--bg-input); color: var(--text-muted); }
 
 /* Limit input in the sidebar controls. */
 .limit-control { display: inline-flex; align-items: center; gap: 0.3rem; }

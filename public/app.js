@@ -19,8 +19,10 @@ const STATE = {
 
   // Preview state
   results: [],           // { source, result, status, error_msg }
-  tags: {},              // result path -> [tag, …] (persisted)
-  activeTag: "marked_hands_in_the_air", // tag that "m"/★ toggles (persisted)
+  tags: {},              // result path -> [tag, …] (persisted) — now only the
+                         // `${base}_positive` / `${base}_negative` basetag labels
+  filterPositive: false, // quick-filter: show only positives for the basetag
+  filterNegative: false, // quick-filter: show only negatives for the basetag
   exportFolder: "filtered_images", // destination for the Export action (persisted)
   exporting: false,      // true while an export_images request is in flight
   currentResultIndex: -1,
@@ -1021,7 +1023,11 @@ function updateFileLogEntry(msg) {
 function initPreviewPage() {
   DOM.imageList = document.getElementById("image-list");
   DOM.imageCount = document.getElementById("image-count");
-  DOM.markedCount = document.getElementById("marked-count");
+  DOM.posCount = document.getElementById("pos-count");
+  DOM.negCount = document.getElementById("neg-count");
+  DOM.btnFilterPos = document.getElementById("btn-filter-pos");
+  DOM.btnFilterNeg = document.getElementById("btn-filter-neg");
+  DOM.currentLabel = document.getElementById("current-label");
   DOM.btnRunProcessors = document.getElementById("btn-run-processors");
   DOM.chkShowFiltered = document.getElementById("chk-show-filtered");
   DOM.chkShowFailed = document.getElementById("chk-show-failed");
@@ -1039,7 +1045,6 @@ function initPreviewPage() {
   DOM.btnToggleLabels = document.getElementById("btn-toggle-labels");
   DOM.btnToggleInfo = document.getElementById("btn-toggle-info");
   DOM.btnToggleKeypoints = document.getElementById("btn-toggle-keypoints");
-  DOM.btnToggleMark = document.getElementById("btn-toggle-mark");
   DOM.btnResetView = document.getElementById("btn-reset-view");
   DOM.infoOverlay = document.getElementById("info-overlay");
   DOM.infoOverlayBody = document.getElementById("info-overlay-body");
@@ -1053,19 +1058,14 @@ function initPreviewPage() {
   DOM.btnToggleLabels.addEventListener("click", toggleLabels);
   DOM.btnToggleInfo.addEventListener("click", toggleInfo);
   DOM.btnToggleKeypoints.addEventListener("click", toggleKeypoints);
-  if (DOM.btnToggleMark) DOM.btnToggleMark.addEventListener("click", toggleActiveTagOnCurrent);
 
-  // Active-tag input: what "m" / the ★ toggles. Re-render so row stars/chips and
-  // the count reflect the newly-active tag.
-  DOM.activeTag = document.getElementById("active-tag");
-  if (DOM.activeTag) {
-    DOM.activeTag.value = STATE.activeTag || "";
-    DOM.activeTag.addEventListener("input", () => {
-      STATE.activeTag = DOM.activeTag.value;
-      saveState();
-      renderImageList();
-      updateTagButton();
-    });
+  // Quick-filter toggles: restrict the list to positives and/or negatives for
+  // the selected basetag (OR across the two when both are on).
+  if (DOM.btnFilterPos) {
+    DOM.btnFilterPos.addEventListener("click", () => toggleLabelFilter("pos"));
+  }
+  if (DOM.btnFilterNeg) {
+    DOM.btnFilterNeg.addEventListener("click", () => toggleLabelFilter("neg"));
   }
   DOM.btnResetView.addEventListener("click", resetView);
   initCanvasZoomPan();
@@ -1292,92 +1292,124 @@ function toggleTag(result, tag) {
   saveTags();
 }
 
-// The tag named in the "Active tag" box (what "m" / the ★ toggles).
-function activeTag() {
-  return (DOM.activeTag?.value ?? STATE.activeTag ?? "").trim();
+// ---- Basetag positive/negative labels ---------------------------------------
+//
+// Images carry only `${base}_positive` / `${base}_negative` tags now (set with
+// ↑ / ↓ in labelCurrent). These helpers surface that state in the list rows, the
+// header counts, the toolbar badge, and the quick-filter buttons.
+
+// "pos" | "neg" | null for the currently-selected basetag.
+function labelStateFor(result) {
+  const base = selectedBasetagName();
+  if (!base || !result) return null;
+  if (hasTag(result, `${base}_positive`)) return "pos";
+  if (hasTag(result, `${base}_negative`)) return "neg";
+  return null;
 }
 
-// Toggle the active tag on the currently-viewed image (toolbar button + "m").
-function toggleActiveTagOnCurrent() {
-  const tag = activeTag();
-  const r = STATE.results[STATE.currentResultIndex];
-  if (!r) return;
-  if (!tag) {
-    setExportStatus("Type a tag in the “Active tag” box first.", true);
-    return;
+// Header badges: how many images are positive / negative for the basetag.
+function updateLabelCounts() {
+  const base = selectedBasetagName();
+  let pos = 0, neg = 0;
+  if (base) {
+    for (const r of STATE.results) {
+      if (hasTag(r, `${base}_positive`)) pos++;
+      else if (hasTag(r, `${base}_negative`)) neg++;
+    }
   }
-  toggleTag(r, tag);
-  refreshRowTagUI(STATE.currentResultIndex);
-  updateTagButton();
-  updateTagCount();
+  if (DOM.posCount) {
+    DOM.posCount.textContent = `↑ ${pos}`;
+    DOM.posCount.title = `${pos} image(s) marked “${base}_positive”`;
+    DOM.posCount.classList.toggle("hidden", !base);
+  }
+  if (DOM.negCount) {
+    DOM.negCount.textContent = `↓ ${neg}`;
+    DOM.negCount.title = `${neg} image(s) marked “${base}_negative”`;
+    DOM.negCount.classList.toggle("hidden", !base);
+  }
 }
 
-function paintStar(el, on) {
-  el.classList.toggle("marked", on);
-  el.textContent = on ? "★" : "☆";
-  el.title = on
-    ? `Tagged “${activeTag()}” — click to remove (m)`
-    : `Tag “${activeTag() || "…"}” (m)`;
-}
-
-// Reflect whether the current image carries the active tag on the toolbar button.
-function updateTagButton() {
-  const btn = DOM.btnToggleMark;
-  if (!btn) return;
-  const r = STATE.results[STATE.currentResultIndex];
-  const tag = activeTag();
-  btn.disabled = !r || !tag;
-  const on = hasTag(r, tag);
-  btn.classList.toggle("btn-active", on);
-  btn.textContent = on ? "★ Tagged" : "☆ Tag";
-  btn.title = tag
-    ? `Toggle tag “${tag}” on this image (M)`
-    : "Set an Active tag in the sidebar first";
-}
-
-// Show how many of the CURRENT results carry the active tag.
-function updateTagCount() {
-  const el = DOM.markedCount;
+// The toolbar badge showing the CURRENT image's label for the basetag.
+function updateCurrentLabel() {
+  const el = DOM.currentLabel;
   if (!el) return;
-  const tag = activeTag();
-  const n = tag ? STATE.results.filter((r) => hasTag(r, tag)).length : 0;
-  el.textContent = `🏷 ${n}`;
-  el.title = tag ? `${n} image(s) tagged “${tag}”` : "Tagged images";
-  el.classList.toggle("hidden", n === 0);
-}
-
-// Build the chip row for an image's tags (the active tag highlighted).
-function buildChips(tags) {
-  const chips = document.createElement("span");
-  chips.className = "tag-chips";
-  const cur = activeTag();
-  for (const t of tags) {
-    const chip = document.createElement("span");
-    chip.className = "tag-chip" + (t === cur ? " active" : "");
-    chip.textContent = t;
-    chip.title = t;
-    chips.appendChild(chip);
+  const base = selectedBasetagName();
+  const r = STATE.results[STATE.currentResultIndex];
+  const state = labelStateFor(r);
+  el.classList.remove("pos", "neg", "none");
+  if (!base) {
+    el.classList.add("none");
+    el.textContent = "No basetag";
+  } else if (state === "pos") {
+    el.classList.add("pos");
+    el.textContent = "↑ Positive";
+  } else if (state === "neg") {
+    el.classList.add("neg");
+    el.textContent = "↓ Negative";
+  } else {
+    el.classList.add("none");
+    el.textContent = "Unlabelled";
   }
-  return chips;
 }
 
-// Update one image row's star + tag chips in place (no full re-render, so the
-// list doesn't jump-scroll when you toggle a tag mid-list).
+// Paint one row's positive/negative indicator + tint.
+function renderRowLabel(div, result) {
+  const state = labelStateFor(result);
+  div.classList.toggle("row-pos", state === "pos");
+  div.classList.toggle("row-neg", state === "neg");
+  const ind = div.querySelector(".label-indicator");
+  if (ind) {
+    ind.classList.remove("pos", "neg", "none");
+    ind.classList.add(state || "none");
+    ind.textContent = state === "pos" ? "↑" : state === "neg" ? "↓" : "";
+    ind.title = state === "pos"
+      ? "Positive"
+      : state === "neg"
+      ? "Negative"
+      : "Unlabelled";
+  }
+}
+
+// Update one row in place after labelling (no full re-render, so the list
+// doesn't jump-scroll). Also refreshes the toolbar badge if it's the current row.
 function refreshRowTagUI(index) {
   const r = STATE.results[index];
   const div = document.querySelector(`.image-item[data-index="${index}"]`);
   if (!r || !div) return;
-  const star = div.querySelector(".mark-star");
-  const on = hasTag(r, activeTag());
-  if (star) paintStar(star, on);
-  div.classList.toggle("marked", on);
-  const info = div.querySelector(".info");
-  if (info) {
-    const old = info.querySelector(".tag-chips");
-    if (old) old.remove();
-    const tags = tagsFor(r);
-    if (tags.length) info.appendChild(buildChips(tags));
+  renderRowLabel(div, r);
+  if (index === STATE.currentResultIndex) updateCurrentLabel();
+}
+
+// Toggle a quick-filter button and re-render the list under the new filter.
+function toggleLabelFilter(which) {
+  if (which === "pos") STATE.filterPositive = !STATE.filterPositive;
+  else STATE.filterNegative = !STATE.filterNegative;
+  saveState();
+  updateLabelFilterButtons();
+  renderImageList();
+}
+
+// Reflect the quick-filter buttons' active/disabled state (disabled when no
+// basetag is selected — there is nothing to filter on).
+function updateLabelFilterButtons() {
+  const base = selectedBasetagName();
+  if (DOM.btnFilterPos) {
+    DOM.btnFilterPos.disabled = !base;
+    DOM.btnFilterPos.classList.toggle("active", !!base && STATE.filterPositive);
   }
+  if (DOM.btnFilterNeg) {
+    DOM.btnFilterNeg.disabled = !base;
+    DOM.btnFilterNeg.classList.toggle("active", !!base && STATE.filterNegative);
+  }
+}
+
+// Re-sync everything that depends on the selected basetag: the quick-filter
+// buttons, the row indicators + header counts (via renderImageList), and the
+// toolbar badge. Called when the basetag selection changes or basetags load.
+function refreshBasetagLabelUI() {
+  updateLabelFilterButtons();
+  renderImageList();
+  updateCurrentLabel();
 }
 
 // ---- Export -----------------------------------------------------------------
@@ -1464,9 +1496,19 @@ function setExportStatus(text, highlight) {
 //  - Processor- / inference-filtered images are hidden unless "Show filtered"
 //    is on (then they remain but are dimmed).
 function visibleResults() {
+  const base = selectedBasetagName();
+  const labelFilter = base && (STATE.filterPositive || STATE.filterNegative);
   return STATE.results.filter((r) => {
     if (isFailed(r) && !STATE.showFailed) return false;
     if (isFilteredOut(r) && !STATE.showFiltered) return false;
+    // Quick basetag-label filter: keep positives and/or negatives (OR when both
+    // toggles are on). Only applies when a basetag is selected.
+    if (labelFilter) {
+      const state = labelStateFor(r);
+      const keep = (STATE.filterPositive && state === "pos") ||
+        (STATE.filterNegative && state === "neg");
+      if (!keep) return false;
+    }
     return true;
   });
 }
@@ -1497,7 +1539,7 @@ function renderImageList() {
 
   DOM.imageCount.textContent = String(visible.length);
   updateFilterStatus();
-  updateTagCount();
+  updateLabelCounts();
   updateExportButton();
 
   if (visible.length === 0) {
@@ -1544,10 +1586,6 @@ function renderImageList() {
     info.appendChild(nameEl);
     info.appendChild(statusEl);
 
-    // Tag chips — show every tag this image carries (the active one highlighted).
-    const rowTags = tagsFor(r);
-    if (rowTags.length) info.appendChild(buildChips(rowTags));
-
     if (isFilteredOut(r)) {
       const tag = document.createElement("span");
       tag.className = "filter-tag";
@@ -1565,23 +1603,11 @@ function renderImageList() {
       div.appendChild(dot);
     }
 
-    // ★ toggles the ACTIVE tag on this image (doesn't select the image).
-    const star = document.createElement("button");
-    star.className = "mark-star";
-    paintStar(star, hasTag(r, activeTag()));
-    star.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (!activeTag()) {
-        setExportStatus("Type a tag in the “Active tag” box first.", true);
-        return;
-      }
-      toggleTag(r, activeTag());
-      refreshRowTagUI(idx);
-      if (STATE.results[STATE.currentResultIndex] === r) updateTagButton();
-      updateTagCount();
-    });
-    div.classList.toggle("marked", hasTag(r, activeTag()));
-    div.appendChild(star);
+    // Positive/negative indicator (↑ / ↓ / none) for the selected basetag.
+    const ind = document.createElement("span");
+    ind.className = "label-indicator";
+    div.appendChild(ind);
+    renderRowLabel(div, r);
 
     div.addEventListener("click", () => selectImage(idx));
 
@@ -1630,8 +1656,8 @@ function selectImage(index) {
   const item = document.querySelector(`.image-item[data-index="${index}"]`);
   if (item) item.classList.add("active");
 
-  // Reflect this image's active-tag state on the toolbar button.
-  updateTagButton();
+  // Reflect this image's positive/negative label on the toolbar badge.
+  updateCurrentLabel();
 
   // Update nav display — show position within the visible (shown) images, not
   // the full result set, so it matches what the arrows actually step through.
@@ -2099,10 +2125,6 @@ function handleKeyboard(e) {
     case "k":
       e.preventDefault();
       toggleKeypoints();
-      break;
-    case "m":
-      e.preventDefault();
-      toggleActiveTagOnCurrent();
       break;
     case "0":
       e.preventDefault();
@@ -3033,8 +3055,9 @@ function saveState() {
     scanPath: FILE_BROWSER.scanPath,
     extFilter: document.getElementById("ext-filter")?.value || ".jpg,.jpeg,.png",
     exportFolder: STATE.exportFolder,
-    activeTag: STATE.activeTag,
     selectedBasetagId: STATE.selectedBasetagId,
+    filterPositive: STATE.filterPositive,
+    filterNegative: STATE.filterNegative,
     invertFilter: STATE.invertFilter,
     limitCount: STATE.limitCount,
   };
@@ -3048,8 +3071,9 @@ function loadState() {
     const state = JSON.parse(raw);
     if (state.scanPath) FILE_BROWSER.scanPath = state.scanPath;
     if (state.exportFolder) STATE.exportFolder = state.exportFolder;
-    if (typeof state.activeTag === "string") STATE.activeTag = state.activeTag;
     if (typeof state.selectedBasetagId === "string") STATE.selectedBasetagId = state.selectedBasetagId;
+    if (typeof state.filterPositive === "boolean") STATE.filterPositive = state.filterPositive;
+    if (typeof state.filterNegative === "boolean") STATE.filterNegative = state.filterNegative;
     if (typeof state.invertFilter === "boolean") STATE.invertFilter = state.invertFilter;
     if (typeof state.limitCount === "number") STATE.limitCount = state.limitCount;
     const extInput = document.getElementById("ext-filter");
@@ -3779,6 +3803,8 @@ function initBasetagsPage() {
           ? `Basetag “${selectedBasetagName()}” — ↑ positive · ↓ negative`
           : "",
       );
+      // The label visuals/counts/filters all key off the selected basetag.
+      refreshBasetagLabelUI();
     });
   }
 
@@ -3817,6 +3843,9 @@ function handleBasetagsList(msg) {
 
   renderBasetagList();
   populateBasetagSelectors();
+  // Basetags arriving (or changing) can resolve/clear the preview selection, so
+  // re-sync the positive/negative label visuals, counts and filters.
+  refreshBasetagLabelUI();
 }
 
 function renderBasetagList() {
@@ -3993,10 +4022,21 @@ function labelCurrent(sign) {
     setBasetagStatus(`Tagged “${wantTag}” → ./${wantTag}/`);
   }
 
-  // Update the row's chips/star and counts; selection stays put (no auto-advance).
-  refreshRowTagUI(STATE.currentResultIndex);
-  updateTagCount();
-  updateTagButton();
+  // Reflect the change; selection stays put (no auto-advance). When a quick
+  // filter is active the image's membership may change, so re-render the whole
+  // list (and re-apply the active highlight); otherwise update just this row so
+  // the list doesn't jump-scroll.
+  if (STATE.filterPositive || STATE.filterNegative) {
+    renderImageList();
+    const cur = document.querySelector(
+      `.image-item[data-index="${STATE.currentResultIndex}"]`,
+    );
+    if (cur) cur.classList.add("active");
+  } else {
+    refreshRowTagUI(STATE.currentResultIndex);
+  }
+  updateLabelCounts();
+  updateCurrentLabel();
 }
 
 function handleUnexportResult(msg) {

@@ -107,7 +107,8 @@
           <div class="sidebar-header">
             <h3>Images</h3>
             <span id="image-count" class="badge">0</span>
-            <span id="marked-count" class="badge marked-badge hidden" title="Images tagged with the active tag">🏷 0</span>
+            <span id="pos-count" class="badge pos-badge hidden" title="Images marked positive for the selected basetag">↑ 0</span>
+            <span id="neg-count" class="badge neg-badge hidden" title="Images marked negative for the selected basetag">↓ 0</span>
           </div>
           <div class="sidebar-controls">
             <button id="btn-run-processors" class="btn btn-primary btn-sm" title="Run all images against active processors">
@@ -126,10 +127,6 @@
               Limit <input type="number" id="limit-count" class="limit-input" min="0" step="1" value="0">
             </label>
           </div>
-          <div class="tag-row" title="The tag that pressing M (or the ★ on a row) toggles on an image">
-            <span class="tag-row-label">Active tag</span>
-            <input type="text" id="active-tag" class="tag-input" placeholder="tag name" value="marked_hands_in_the_air">
-          </div>
           <div class="tag-row basetag-row" title="Pick a basetag, then press ↑ to mark this image positive or ↓ to mark it negative. The image is copied into the matching folder automatically.">
             <span class="tag-row-label">Basetag</span>
             <select id="basetag-select" class="tag-input">
@@ -137,6 +134,10 @@
             </select>
           </div>
           <p class="hint basetag-hint">↑ = <code>_positive</code> · ↓ = <code>_negative</code> · same key again clears it</p>
+          <div class="sidebar-controls label-filter-row">
+            <button id="btn-filter-pos" class="btn btn-sm label-filter-btn pos" title="Show only images marked positive" disabled>↑ Positive</button>
+            <button id="btn-filter-neg" class="btn btn-sm label-filter-btn neg" title="Show only images marked negative" disabled>↓ Negative</button>
+          </div>
           <div id="basetag-status" class="processor-filter-status"></div>
           <div id="processor-filter-status" class="processor-filter-status"></div>
           <div class="export-row" title="Copy the images that passed your filters (and their pose JSON) into this folder">
@@ -204,9 +205,7 @@
               <button id="btn-toggle-keypoints" class="btn btn-sm" title="Toggle per-keypoint pixel coordinates (K)">
                 Show Keypoints
               </button>
-              <button id="btn-toggle-mark" class="btn btn-sm" title="Toggle the active tag on this image (M)">
-                ☆ Tag
-              </button>
+              <span id="current-label" class="current-label none" title="This image's label for the selected basetag (↑ positive / ↓ negative)">Unlabelled</span>
               <button id="btn-reset-view" class="btn btn-sm" title="Reset zoom &amp; pan (0)">
                 Reset View
               </button>

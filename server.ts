@@ -20,6 +20,9 @@ interface AppConfig {
   maxConcurrency: number;
   modelDir: string;
   venvDir: string;
+  // VitPose model used for pose scanning, recorded in each pose JSON. One of
+  // "vitpose-base" (default) or "vitpose-base-simple".
+  poseModel: string;
 }
 
 interface ScanFolderMessage {
@@ -401,6 +404,7 @@ async function loadConfig(): Promise<AppConfig> {
       maxConcurrency: saved.maxConcurrency || 3,
       modelDir: saved.modelDir || "./models",
       venvDir: saved.venvDir || "./.venv",
+      poseModel: saved.poseModel || "vitpose-base",
     };
   } catch {
     // First run — create default config
@@ -410,6 +414,7 @@ async function loadConfig(): Promise<AppConfig> {
       maxConcurrency: 3,
       modelDir: "./models",
       venvDir: "./.venv",
+      poseModel: "vitpose-base",
     };
     try {
       await Deno.writeTextFile(
@@ -593,6 +598,8 @@ interface VitPoseResult {
       confidence: number;
     }>;
   }>;
+  // The VitPose model that produced this result (echoed back by the script).
+  pose_model?: string;
   error?: string;
 }
 
@@ -606,6 +613,7 @@ async function runPythonBatchInference(
   pythonPath: string,
   imagePaths: string[],
   modelDir: string,
+  poseModel: string,
   signal?: AbortSignal,
   onLog?: (line: string) => void,
   onResult?: (result: VitPoseResult) => Promise<void> | void,
@@ -614,6 +622,7 @@ async function runPythonBatchInference(
     "python/f_o_info_vitpose.py",
     ...imagePaths,
     "--model-dir", modelDir,
+    "--pose-model", poseModel,
   ];
 
   const command = new Deno.Command(pythonPath, {
@@ -1079,6 +1088,9 @@ async function handleScanFolder(
       if (result.success) {
         const poseData = {
           image: imagePath,
+          // Which VitPose model produced this pose (falls back to the configured
+          // default if an older script didn't echo it back).
+          pose_model: result.pose_model || config.poseModel || "vitpose-base",
           people: result.people.map((p) => ({
             id: p.person_id,
             keypoints: p.keypoints,
@@ -1130,11 +1142,13 @@ async function handleScanFolder(
       // Call the VitPose batch script — processes all images in one invocation
       // (models load once, then images stream back one result at a time).
       const modelDir = config.modelDir || "./models";
-      log("Launching VitPose inference (this can take a while on first run)…");
+      const poseModel = config.poseModel || "vitpose-base";
+      log(`Launching VitPose inference (${poseModel}; this can take a while on first run)…`);
       const summary = await runPythonBatchInference(
         config.pythonPath,
         toProcess,
         modelDir,
+        poseModel,
         abortController.signal,
         (line) => log(line, "python"),
         onResult,

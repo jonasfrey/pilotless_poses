@@ -87,6 +87,17 @@ Aim for a few hundred of each, roughly balanced. Use **Limit** to cap.
    shows **trained** with test accuracy + top features. Each successful train
    bumps the model's version.
 
+> Works for **any** pose, not just arm/hand poses. Each detected person is turned
+> into a pose-agnostic feature vector: scale-normalized keypoint positions, joint
+> flexion angles (elbows, knees, hips, shoulders), limb-segment orientations,
+> left/right symmetry, leg/foot vertical relations, and a body bounding box — so
+> "leg raised", "sitting", "leaning", etc. train as well as "hands up".
+
+> **Upgrading existing models:** the feature set is versioned (currently **v2**).
+> A model trained on an older set can't be applied — **Apply** will report
+> *"trained with an older feature set … Retrain the model."* Just hit **Train**
+> again on the same folders to bring it up to date.
+
 ---
 
 ## 6. Verify in the preview
